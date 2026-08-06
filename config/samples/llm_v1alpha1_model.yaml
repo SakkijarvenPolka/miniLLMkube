@@ -1,0 +1,17 @@
+apiVersion: llm.example.io/v1alpha1
+kind: Model
+metadata:
+  labels:
+    app.kubernetes.io/name: minillmkube
+    app.kubernetes.io/managed-by: kustomize
+  name: qwen3-0-6b
+spec:
+  source: https://hf-mirror.com/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf
+  replicas: 1
+  contextSize: 4096
+  resources:
+    requests:
+      cpu: "1"
+      memory: "2Gi"
+    limits:
+      memory: "4Gi"

@@ -1,0 +1,301 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"os"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	llmv1alpha1 "github.com/SakkijarvenPolka/minillmkube/api/v1alpha1"
+)
+
+var _ = Describe("Model Controller", func() {
+	Context("When reconciling a resource", func() {
+		const (
+			resourceName = "test-resource"
+			modelSource  = "https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf"
+			modelImage   = "ghcr.io/ggml-org/llama.cpp:server"
+		)
+
+		ctx := context.Background()
+		replicas := int32(1)
+
+		typeNamespacedName := types.NamespacedName{
+			Name:      resourceName,
+			Namespace: "default",
+		}
+		model := &llmv1alpha1.Model{}
+		var controllerReconciler *ModelReconciler
+
+		BeforeEach(func() {
+			controllerReconciler = &ModelReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+
+			By("creating the custom resource for the Kind Model")
+			err := k8sClient.Get(ctx, typeNamespacedName, model)
+			if err != nil && errors.IsNotFound(err) {
+				resource := &llmv1alpha1.Model{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      resourceName,
+						Namespace: "default",
+					},
+					Spec: llmv1alpha1.ModelSpec{
+						Source:      modelSource,
+						Replicas:    &replicas,
+						ContextSize: 4096,
+						Image:       modelImage,
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse("1"),
+								corev1.ResourceMemory: resource.MustParse("1Gi"),
+							},
+						},
+					},
+				}
+				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			}
+		})
+
+		AfterEach(func() {
+			Expect(k8sClient.DeleteAllOf(ctx, &appsv1.Deployment{},
+				client.InNamespace(typeNamespacedName.Namespace))).To(Succeed())
+			Expect(k8sClient.DeleteAllOf(ctx, &corev1.Service{},
+				client.InNamespace(typeNamespacedName.Namespace))).To(Succeed())
+
+			resource := &llmv1alpha1.Model{}
+			err := k8sClient.Get(ctx, typeNamespacedName, resource)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Cleanup the specific resource instance Model")
+			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+		})
+		It("creates the inference Deployment and Service", func() {
+			By("Reconciling the created resource")
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			Expect(deployment.Spec.Replicas).To(HaveValue(Equal(int32(1))))
+			Expect(deployment.Spec.ProgressDeadlineSeconds).To(HaveValue(Equal(int32(1800))))
+			Expect(deployment.Spec.Template.Spec.Volumes).To(HaveLen(1))
+			Expect(deployment.Spec.Template.Spec.Volumes[0].EmptyDir).NotTo(BeNil())
+			Expect(deployment.Spec.Template.Spec.Volumes[0].HostPath).To(BeNil())
+			Expect(deployment.Spec.Template.Spec.InitContainers).To(HaveLen(1))
+			Expect(deployment.Spec.Template.Spec.InitContainers[0].Image).To(Equal("curlimages/curl:8.11.1"))
+			Expect(deployment.Spec.Template.Spec.InitContainers[0].ImagePullPolicy).To(Equal(corev1.PullIfNotPresent))
+			Expect(deployment.Spec.Template.Spec.InitContainers[0].Command).To(Equal([]string{"sh", "-c"}))
+			Expect(deployment.Spec.Template.Spec.InitContainers[0].Args).To(HaveLen(1))
+			Expect(deployment.Spec.Template.Spec.InitContainers[0].Args[0]).To(ContainSubstring("curl -fL"))
+			Expect(deployment.Spec.Template.Spec.InitContainers[0].Env).To(ContainElement(corev1.EnvVar{
+				Name:  "MODEL_URL",
+				Value: modelSource,
+			}))
+			Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(1))
+			Expect(deployment.Spec.Template.Spec.Containers[0].Image).To(Equal(modelImage))
+			Expect(deployment.Spec.Template.Spec.Containers[0].ImagePullPolicy).To(Equal(corev1.PullIfNotPresent))
+			Expect(deployment.Spec.Template.Spec.Containers[0].StartupProbe).NotTo(BeNil())
+			Expect(deployment.Spec.Template.Spec.Containers[0].StartupProbe.PeriodSeconds).To(Equal(int32(5)))
+			Expect(deployment.Spec.Template.Spec.Containers[0].StartupProbe.FailureThreshold).To(Equal(int32(120)))
+			Expect(deployment.Spec.Template.Spec.Containers[0].ReadinessProbe.TimeoutSeconds).To(Equal(int32(3)))
+			Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(ContainElements(
+				"--model", "/models/model.gguf", "--ctx-size", "4096",
+			))
+			Expect(deployment.OwnerReferences).To(HaveLen(1))
+			Expect(deployment.OwnerReferences[0].Name).To(Equal(resourceName))
+
+			service := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, service)).To(Succeed())
+			Expect(service.Spec.Ports).To(HaveLen(1))
+			Expect(service.Spec.Ports[0].Port).To(Equal(int32(8080)))
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal("Pending"))
+			Expect(model.Status.Endpoint).To(Equal("http://test-resource.default.svc.cluster.local:8080"))
+		})
+
+		It("uses a hostPath model cache when MODEL_CACHE_HOST_PATH is set", func() {
+			cachePath := "/tmp/minillmkube-model-cache"
+			Expect(os.Setenv("MODEL_CACHE_HOST_PATH", cachePath)).To(Succeed())
+			defer func() {
+				Expect(os.Unsetenv("MODEL_CACHE_HOST_PATH")).To(Succeed())
+			}()
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			Expect(deployment.Spec.Template.Spec.Volumes).To(HaveLen(1))
+			Expect(deployment.Spec.Template.Spec.Volumes[0].EmptyDir).To(BeNil())
+			Expect(deployment.Spec.Template.Spec.Volumes[0].HostPath).NotTo(BeNil())
+			Expect(deployment.Spec.Template.Spec.Volumes[0].HostPath.Path).To(Equal(cachePath))
+			Expect(deployment.Spec.Template.Spec.Volumes[0].HostPath.Type).To(HaveValue(Equal(corev1.HostPathDirectoryOrCreate)))
+		})
+
+		It("rejects invalid model sources without creating a Deployment", func() {
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			model.Spec.Source = "http://huggingface.co/example/model.gguf"
+			Expect(k8sClient.Update(ctx, model)).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal("Failed"))
+			Expect(model.Status.Conditions).To(ContainElement(WithTransform(func(condition metav1.Condition) string {
+				return condition.Reason
+			}, Equal("InvalidSpec"))))
+
+			deployment := &appsv1.Deployment{}
+			err = k8sClient.Get(ctx, typeNamespacedName, deployment)
+			Expect(errors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("allows Hugging Face download URLs with query strings", func() {
+			sourceWithQuery := modelSource + "?download=true"
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			model.Spec.Source = sourceWithQuery
+			Expect(k8sClient.Update(ctx, model)).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			Expect(deployment.Spec.Template.Spec.InitContainers[0].Env).To(ContainElement(corev1.EnvVar{
+				Name:  "MODEL_URL",
+				Value: sourceWithQuery,
+			}))
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal("Pending"))
+		})
+
+		It("marks only the current Deployment generation as Ready", func() {
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			observedGeneration := deployment.Generation
+			deployment.Spec.Template.Annotations = map[string]string{"rollout": "new-spec"}
+			Expect(k8sClient.Update(ctx, deployment)).To(Succeed())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			Expect(deployment.Generation).To(BeNumerically(">", observedGeneration))
+			deployment.Status.Replicas = 1
+			deployment.Status.ReadyReplicas = 1
+			deployment.Status.UpdatedReplicas = 1
+			deployment.Status.AvailableReplicas = 1
+			deployment.Status.ObservedGeneration = observedGeneration
+			Expect(k8sClient.Status().Update(ctx, deployment)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal("Deploying"))
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			deployment.Status.ObservedGeneration = deployment.Generation
+			Expect(k8sClient.Status().Update(ctx, deployment)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal("Ready"))
+		})
+
+		It("marks a deployment progress deadline as Failed", func() {
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			deployment.Status.ObservedGeneration = deployment.Generation
+			deployment.Status.Replicas = 1
+			deployment.Status.Conditions = []appsv1.DeploymentCondition{{
+				Type:    appsv1.DeploymentProgressing,
+				Status:  corev1.ConditionFalse,
+				Reason:  "ProgressDeadlineExceeded",
+				Message: "Deployment exceeded its progress deadline",
+			}}
+			Expect(k8sClient.Status().Update(ctx, deployment)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal("Failed"))
+			Expect(model.Status.Conditions).To(ContainElement(WithTransform(func(condition metav1.Condition) string {
+				return condition.Reason
+			}, Equal("ProgressDeadlineExceeded"))))
+		})
+
+		It("restores the Service type to ClusterIP", func() {
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			service := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, service)).To(Succeed())
+			service.Spec.Type = corev1.ServiceTypeNodePort
+			service.Spec.Ports[0].NodePort = 30080
+			Expect(k8sClient.Update(ctx, service)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, service)).To(Succeed())
+			Expect(service.Spec.Type).To(Equal(corev1.ServiceTypeClusterIP))
+			Expect(service.Spec.Ports[0].NodePort).To(BeZero())
+		})
+	})
+})
