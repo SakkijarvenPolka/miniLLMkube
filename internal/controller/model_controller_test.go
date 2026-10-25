@@ -390,6 +390,41 @@ var _ = Describe("Model Controller", func() {
 			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
 			Expect(deployment.ResourceVersion).To(Equal(resourceVersion))
 		})
+		It("requests a GPU when spec.gpu is set", func() {
+			Expect(os.Unsetenv(gpuRuntimeClassEnv)).To(Succeed())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			model.Spec.GPU = &llmv1alpha1.GPUSpec{}
+			Expect(k8sClient.Update(ctx, model)).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+
+			// No RuntimeClass comes from the environment here, so the Pod stays
+			// on the cluster default and is scheduled by the resource request.
+			Expect(deployment.Spec.Template.Spec.RuntimeClassName).To(BeNil())
+			Expect(deployment.Spec.Template.Spec.Containers[0].Resources.Limits).To(HaveKeyWithValue(
+				corev1.ResourceName(gpuResourceName), resource.MustParse("1"),
+			))
+			// The CRD defaults gpu.layers to 99 on the stored object.
+			Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(ContainElements(
+				"--n-gpu-layers", "99",
+			))
+
+			By("not rewriting the Deployment on the next reconcile")
+			resourceVersion := deployment.ResourceVersion
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			Expect(deployment.ResourceVersion).To(Equal(resourceVersion))
+		})
 	})
 })
 
