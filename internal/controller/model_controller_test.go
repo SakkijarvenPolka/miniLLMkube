@@ -48,7 +48,7 @@ var _ = Describe("Model Controller", func() {
 
 		typeNamespacedName := types.NamespacedName{
 			Name:      resourceName,
-			Namespace: "default",
+			Namespace: testNamespace,
 		}
 		model := &llmv1alpha1.Model{}
 		var controllerReconciler *ModelReconciler
@@ -65,7 +65,7 @@ var _ = Describe("Model Controller", func() {
 				resource := &llmv1alpha1.Model{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      resourceName,
-						Namespace: "default",
+						Namespace: testNamespace,
 					},
 					Spec: llmv1alpha1.ModelSpec{
 						Source:      modelSource,
@@ -121,6 +121,18 @@ var _ = Describe("Model Controller", func() {
 				Name:  "MODEL_URL",
 				Value: modelSource,
 			}))
+			Expect(deployment.Spec.Template.Spec.InitContainers[0].Env).To(ContainElement(corev1.EnvVar{
+				Name:  "MODEL_DIR",
+				Value: "/models/" + cacheKeyFor(modelSource),
+			}))
+			Expect(deployment.Spec.Template.Spec.InitContainers[0].Env).To(ContainElement(corev1.EnvVar{
+				Name:  "MODEL_FILE",
+				Value: testModelFileName,
+			}))
+			Expect(deployment.Spec.Template.Spec.InitContainers[0].Env).To(ContainElement(corev1.EnvVar{
+				Name:  "EXPECT_FORMAT",
+				Value: "gguf",
+			}))
 			Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(deployment.Spec.Template.Spec.Containers[0].Image).To(Equal(modelImage))
 			Expect(deployment.Spec.Template.Spec.Containers[0].ImagePullPolicy).To(Equal(corev1.PullIfNotPresent))
@@ -129,7 +141,7 @@ var _ = Describe("Model Controller", func() {
 			Expect(deployment.Spec.Template.Spec.Containers[0].StartupProbe.FailureThreshold).To(Equal(int32(120)))
 			Expect(deployment.Spec.Template.Spec.Containers[0].ReadinessProbe.TimeoutSeconds).To(Equal(int32(3)))
 			Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(ContainElements(
-				"--model", "/models/model.gguf", "--ctx-size", "4096",
+				"--model", "/models/"+cacheKeyFor(modelSource)+"/"+testModelFileName, "--ctx-size", "4096",
 			))
 			Expect(deployment.OwnerReferences).To(HaveLen(1))
 			Expect(deployment.OwnerReferences[0].Name).To(Equal(resourceName))
@@ -142,6 +154,7 @@ var _ = Describe("Model Controller", func() {
 			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
 			Expect(model.Status.Phase).To(Equal("Pending"))
 			Expect(model.Status.Endpoint).To(Equal("http://test-resource.default.svc.cluster.local:8080"))
+			Expect(model.Status.CacheKey).To(Equal(cacheKeyFor(modelSource)))
 		})
 
 		It("uses a hostPath model cache when MODEL_CACHE_HOST_PATH is set", func() {
@@ -163,6 +176,20 @@ var _ = Describe("Model Controller", func() {
 			Expect(deployment.Spec.Template.Spec.Volumes[0].HostPath).NotTo(BeNil())
 			Expect(deployment.Spec.Template.Spec.Volumes[0].HostPath.Path).To(Equal(cachePath))
 			Expect(deployment.Spec.Template.Spec.Volumes[0].HostPath.Type).To(HaveValue(Equal(corev1.HostPathDirectoryOrCreate)))
+
+			By("preparing the cache root before downloading")
+			Expect(deployment.Spec.Template.Spec.InitContainers).To(HaveLen(2))
+			cachePrep := deployment.Spec.Template.Spec.InitContainers[0]
+			Expect(cachePrep.Name).To(Equal("cache-prep"))
+			Expect(cachePrep.Command).To(Equal([]string{"chown", "100:101", "/models"}))
+			Expect(cachePrep.SecurityContext).NotTo(BeNil())
+			Expect(cachePrep.SecurityContext.RunAsUser).To(HaveValue(Equal(int64(0))))
+			Expect(cachePrep.SecurityContext.RunAsNonRoot).To(HaveValue(BeFalse()))
+			Expect(cachePrep.SecurityContext.AllowPrivilegeEscalation).To(HaveValue(BeFalse()))
+			Expect(cachePrep.SecurityContext.Capabilities).NotTo(BeNil())
+			Expect(cachePrep.SecurityContext.Capabilities.Drop).To(ConsistOf(corev1.Capability("ALL")))
+			Expect(cachePrep.SecurityContext.Capabilities.Add).To(ConsistOf(corev1.Capability("CHOWN")))
+			Expect(deployment.Spec.Template.Spec.InitContainers[1].Name).To(Equal("model-downloader"))
 		})
 
 		It("rejects invalid model sources without creating a Deployment", func() {
@@ -297,5 +324,80 @@ var _ = Describe("Model Controller", func() {
 			Expect(service.Spec.Type).To(Equal(corev1.ServiceTypeClusterIP))
 			Expect(service.Spec.Ports[0].NodePort).To(BeZero())
 		})
+		It("gives models with different sources different cache directories", func() {
+			const otherSource = "https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf"
+			otherName := types.NamespacedName{Name: resourceName + "-other", Namespace: typeNamespacedName.Namespace}
+			other := &llmv1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: otherName.Name, Namespace: otherName.Namespace},
+				Spec:       llmv1alpha1.ModelSpec{Source: otherSource},
+			}
+			Expect(k8sClient.Create(ctx, other)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, other))).To(Succeed())
+			})
+
+			for _, name := range []types.NamespacedName{typeNamespacedName, otherName} {
+				_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			dirs := make([]string, 0, 2)
+			for _, name := range []types.NamespacedName{typeNamespacedName, otherName} {
+				deployment := &appsv1.Deployment{}
+				Expect(k8sClient.Get(ctx, name, deployment)).To(Succeed())
+				dirs = append(dirs, envValue(deployment.Spec.Template.Spec.InitContainers[0].Env, "MODEL_DIR"))
+			}
+			Expect(dirs[0]).To(Equal("/models/" + cacheKeyFor(modelSource)))
+			Expect(dirs[1]).To(Equal("/models/" + cacheKeyFor(otherSource)))
+			Expect(dirs[0]).NotTo(Equal(dirs[1]))
+		})
+
+		It("does not rewrite the Deployment when nothing changed", func() {
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			deployment.Status.ObservedGeneration = deployment.Generation
+			deployment.Status.Replicas = 1
+			deployment.Status.ReadyReplicas = 1
+			deployment.Status.UpdatedReplicas = 1
+			deployment.Status.AvailableReplicas = 1
+			Expect(k8sClient.Status().Update(ctx, deployment)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal("Ready"))
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			resourceVersion := deployment.ResourceVersion
+
+			By("touching the Model without changing anything the Deployment depends on")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			model.Annotations = map[string]string{"f9-regression": "true"}
+			Expect(k8sClient.Update(ctx, model)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			Expect(deployment.ResourceVersion).To(Equal(resourceVersion))
+		})
 	})
 })
+
+func envValue(env []corev1.EnvVar, name string) string {
+	for _, item := range env {
+		if item.Name == name {
+			return item.Value
+		}
+	}
+	return ""
+}

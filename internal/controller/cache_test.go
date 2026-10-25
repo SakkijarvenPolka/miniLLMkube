@@ -24,7 +24,11 @@ import (
 	llmv1alpha1 "github.com/SakkijarvenPolka/minillmkube/api/v1alpha1"
 )
 
-const testModelSource = "https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf"
+const (
+	testModelSource   = "https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf"
+	testModelFileName = "Qwen3-0.6B-Q4_K_M.gguf"
+	testNamespace     = "default"
+)
 
 func TestCacheKeyFor(t *testing.T) {
 	t.Run("same source yields the same key", func(t *testing.T) {
@@ -63,12 +67,12 @@ func TestModelFileName(t *testing.T) {
 		{
 			name:   "plain URL",
 			source: testModelSource,
-			want:   "Qwen3-0.6B-Q4_K_M.gguf",
+			want:   testModelFileName,
 		},
 		{
 			name:   "query string is ignored for the name",
 			source: testModelSource + "?download=true",
-			want:   "Qwen3-0.6B-Q4_K_M.gguf",
+			want:   testModelFileName,
 		},
 		{
 			name:   "percent encoded slash falls back",
@@ -118,7 +122,7 @@ func TestModelFileName(t *testing.T) {
 
 func TestModelPaths(t *testing.T) {
 	model := &llmv1alpha1.Model{
-		ObjectMeta: metav1.ObjectMeta{Name: "qwen", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen", Namespace: testNamespace},
 		Spec:       llmv1alpha1.ModelSpec{Source: testModelSource},
 	}
 

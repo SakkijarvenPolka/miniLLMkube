@@ -172,7 +172,7 @@ func (r *ModelReconciler) reconcileDeployment(
 		deployment.Spec.Replicas = pointerTo(replicasFor(model))
 		deployment.Spec.ProgressDeadlineSeconds = pointerTo(int32(progressDeadline))
 		deployment.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
-		deployment.Spec.Template.ObjectMeta.Labels = labels
+		deployment.Spec.Template.Labels = labels
 		// Only the fields this operator owns are assigned; see applyPodSpec.
 		applyPodSpec(&deployment.Spec.Template.Spec, buildPodSpec(model))
 		return controllerutil.SetControllerReference(model, deployment, r.Scheme)

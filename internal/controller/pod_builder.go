@@ -130,7 +130,10 @@ func inferenceContainer(model *llmv1alpha1.Model) corev1.Container {
 func startupProbe() *corev1.Probe {
 	return &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
-			Path: "/health", Port: intstr.FromString("http"),
+			// Scheme is explicit for the same reason as the counters below: the
+			// API server defaults it to HTTP, and an unset field would make the
+			// stored template differ from the rendered one on every reconcile.
+			Path: "/health", Port: intstr.FromString("http"), Scheme: corev1.URISchemeHTTP,
 		}},
 		PeriodSeconds: 5, TimeoutSeconds: 1, SuccessThreshold: 1, FailureThreshold: 120,
 	}
@@ -141,7 +144,10 @@ func startupProbe() *corev1.Probe {
 func readinessProbe() *corev1.Probe {
 	return &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
-			Path: "/health", Port: intstr.FromString("http"),
+			// Scheme is explicit for the same reason as the counters below: the
+			// API server defaults it to HTTP, and an unset field would make the
+			// stored template differ from the rendered one on every reconcile.
+			Path: "/health", Port: intstr.FromString("http"), Scheme: corev1.URISchemeHTTP,
 		}},
 		PeriodSeconds: 10, TimeoutSeconds: 3, SuccessThreshold: 1, FailureThreshold: 3,
 	}
