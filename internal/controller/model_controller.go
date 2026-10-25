@@ -42,7 +42,6 @@ import (
 
 const (
 	inferencePort    = 8080
-	modelPath        = "/models/model.gguf"
 	defaultImage     = "ghcr.io/ggml-org/llama.cpp:server"
 	downloaderImage  = "curlimages/curl:8.11.1"
 	defaultContext   = 4096
@@ -162,64 +161,8 @@ func (r *ModelReconciler) reconcileDeployment(
 		deployment.Spec.ProgressDeadlineSeconds = pointerTo(int32(progressDeadline))
 		deployment.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
 		deployment.Spec.Template.ObjectMeta.Labels = labels
-		deployment.Spec.Template.Spec.Volumes = []corev1.Volume{modelVolume()}
-		deployment.Spec.Template.Spec.InitContainers = []corev1.Container{{
-			Name:            "model-downloader",
-			Image:           downloaderImage,
-			ImagePullPolicy: corev1.PullIfNotPresent,
-			Command:         []string{"sh", "-c"},
-			Args: []string{`set -e
-if [ -s /models/model.gguf ]; then
-  echo "model already exists, skipping download"
-  exit 0
-fi
-curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o /models/model.gguf.tmp "$MODEL_URL"
-mv /models/model.gguf.tmp /models/model.gguf`},
-			Env: []corev1.EnvVar{{
-				Name:  "MODEL_URL",
-				Value: model.Spec.Source,
-			}},
-			VolumeMounts: []corev1.VolumeMount{{
-				Name:      modelVolumeName,
-				MountPath: "/models",
-			}},
-		}}
-		deployment.Spec.Template.Spec.Containers = []corev1.Container{{
-			Name:            "llama-server",
-			Image:           imageFor(model),
-			ImagePullPolicy: corev1.PullIfNotPresent,
-			Args:            serverArgs(model),
-			Resources:       model.Spec.Resources,
-			Ports: []corev1.ContainerPort{{
-				Name:          "http",
-				ContainerPort: inferencePort,
-				Protocol:      corev1.ProtocolTCP,
-			}},
-			VolumeMounts: []corev1.VolumeMount{{
-				Name:      modelVolumeName,
-				MountPath: "/models",
-			}},
-			StartupProbe: &corev1.Probe{
-				ProbeHandler: corev1.ProbeHandler{
-					HTTPGet: &corev1.HTTPGetAction{
-						Path: "/health",
-						Port: intstr.FromString("http"),
-					},
-				},
-				PeriodSeconds:    5,
-				FailureThreshold: 120,
-			},
-			ReadinessProbe: &corev1.Probe{
-				ProbeHandler: corev1.ProbeHandler{
-					HTTPGet: &corev1.HTTPGetAction{
-						Path: "/health",
-						Port: intstr.FromString("http"),
-					},
-				},
-				TimeoutSeconds: 3,
-			},
-		}}
-
+		// Only the fields this operator owns are assigned; see applyPodSpec.
+		applyPodSpec(&deployment.Spec.Template.Spec, buildPodSpec(model))
 		return controllerutil.SetControllerReference(model, deployment, r.Scheme)
 	})
 	return deployment, err
@@ -261,6 +204,7 @@ func (r *ModelReconciler) updateStatus(
 		model.Status.Endpoint = state.endpoint
 	}
 	model.Status.ReadyReplicas = readyReplicas
+	model.Status.CacheKey = cacheKeyFor(model.Spec.Source)
 	model.Status.ObservedGeneration = model.Generation
 	meta.SetStatusCondition(&model.Status.Conditions, metav1.Condition{
 		Type:               readyCondition,
@@ -395,11 +339,18 @@ func contextSizeFor(model *llmv1alpha1.Model) int32 {
 
 func serverArgs(model *llmv1alpha1.Model) []string {
 	return []string{
-		"--model", modelPath,
+		"--model", modelFilePathFor(model),
 		"--host", "0.0.0.0",
 		"--port", strconv.Itoa(inferencePort),
 		"--ctx-size", strconv.FormatInt(int64(contextSizeFor(model)), 10),
 	}
+}
+
+// usesHostPathCache reports whether the operator was configured with a host
+// directory shared by every Pod (MODEL_CACHE_HOST_PATH). Both the volume and
+// the cache-prep init container depend on this single decision.
+func usesHostPathCache() bool {
+	return os.Getenv(modelCacheEnv) != ""
 }
 
 func modelVolume() corev1.Volume {
