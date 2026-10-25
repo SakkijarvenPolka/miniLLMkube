@@ -26,6 +26,7 @@ import (
 const (
 	inferenceContainerName  = "llama-server"
 	downloaderContainerName = "model-downloader"
+	cachePrepContainerName  = "cache-prep"
 )
 
 // buildPodSpec renders the Pod template of the inference Deployment. It is a
@@ -45,9 +46,42 @@ func buildPodSpec(model *llmv1alpha1.Model) corev1.PodSpec {
 	}
 }
 
-// initContainersFor returns the init containers in execution order.
+// initContainersFor returns the init containers in execution order: prepare
+// the cache root first, then download the model file.
 func initContainersFor(model *llmv1alpha1.Model) []corev1.Container {
-	return []corev1.Container{downloaderContainer(model)}
+	var containers []corev1.Container
+	if usesHostPathCache() {
+		containers = append(containers, cachePrepContainer())
+	}
+	return append(containers, downloaderContainer(model))
+}
+
+// cachePrepContainer hands the mounted cache root to the downloader user. It
+// only runs with a hostPath cache: the host directory is created by the kubelet
+// as root while the downloader runs as uid 100.
+//
+// chown is the entry process itself rather than "sh -c chown": a non-root
+// process loses its added capabilities across execve (E10). Only the mount root
+// is chowned, not recursively, and subdirectories are created by the downloader
+// itself — root only holds CHOWN here, not DAC_OVERRIDE.
+func cachePrepContainer() corev1.Container {
+	return corev1.Container{
+		Name:    cachePrepContainerName,
+		Image:   downloaderImage,
+		Command: []string{"chown", "100:101", modelMountPath},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser:                pointerTo(int64(0)),
+			RunAsNonRoot:             pointerTo(false),
+			AllowPrivilegeEscalation: pointerTo(false),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+				Add:  []corev1.Capability{"CHOWN"},
+			},
+		},
+		ImagePullPolicy:          corev1.PullIfNotPresent,
+		TerminationMessagePath:   corev1.TerminationMessagePathDefault,
+		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
+	}
 }
 
 // downloaderContainer downloads the model file into the per-source cache
