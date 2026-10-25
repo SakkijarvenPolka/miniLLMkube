@@ -32,6 +32,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -99,7 +100,16 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, r.updateStatus(ctx, model, state, 0)
 	}
 
-	deployment, err := r.reconcileDeployment(ctx, model)
+	// Updates of the Deployment and the Service are optimistic: a concurrent
+	// writer (kubelet-driven status updates, a second controller) can bump the
+	// resource version between Get and Update, which surfaces as a 409. Retrying
+	// re-reads the object, so the second attempt sees the fresh version.
+	var deployment *appsv1.Deployment
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var reconcileErr error
+		deployment, reconcileErr = r.reconcileDeployment(ctx, model)
+		return reconcileErr
+	})
 	if err != nil {
 		log.Error(err, "Failed to reconcile Deployment", "name", model.Name)
 		statusErr := r.updateStatus(ctx, model, rolloutState{
@@ -111,7 +121,9 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
 
-	if err := r.reconcileService(ctx, model); err != nil {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		return r.reconcileService(ctx, model)
+	}); err != nil {
 		log.Error(err, "Failed to reconcile Service", "name", model.Name)
 		statusErr := r.updateStatus(ctx, model, rolloutState{
 			phase:   phaseFailed,
