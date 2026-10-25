@@ -65,6 +65,10 @@ type ModelStatus struct {
 	// ReadyReplicas 就绪副本数
 	// +optional
 	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
+	// CacheKey 缓存目录名，等于 sha256(spec.source) 的前 12 个十六进制字符。
+	// 模型文件位于缓存根目录下 <CacheKey>/ 子目录，便于到宿主机上定位文件。
+	// +optional
+	CacheKey string `json:"cacheKey,omitempty"`
 	// ObservedGeneration 已处理的 spec 版本，用于判断 status 是否过期
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
