@@ -44,14 +44,49 @@ type ModelSpec struct {
 	// +kubebuilder:validation:Minimum=128
 	// +optional
 	ContextSize int32 `json:"contextSize,omitempty"`
-	// Image is the container image for the llama.cpp inference server.
-	// When empty, defaults to "ghcr.io/ggml-org/llama.cpp:server".
-	// +kubebuilder:default="ghcr.io/ggml-org/llama.cpp:server"
+	// Image is the container image of the inference server.
+	// When empty, the operator picks the engine image from the backend
+	// (llama.cpp today) and from whether the Model asks for a GPU.
 	// +optional
 	Image string `json:"image,omitempty"`
 	// Resources sets CPU and memory requests and limits for the inference container.
 	// +optional
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+	// GPU requests GPU acceleration for the inference server.
+	// Setting it at all (even to "{}") is what enables GPU mode: the operator
+	// then uses the CUDA image, requests nvidia.com/gpu and offloads Layers
+	// layers of the model to the GPU. Leaving it nil runs the CPU engine.
+	// +optional
+	GPU *GPUSpec `json:"gpu,omitempty"`
+	// RuntimeClassName is the RuntimeClass of the inference Pod, for example
+	// "nvidia". When empty and GPU mode is enabled, the operator falls back to
+	// the GPU_RUNTIME_CLASS environment variable of its own Deployment, and then
+	// to no RuntimeClass at all (the cluster default).
+	// +optional
+	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
+	// ExtraArgs are appended verbatim to the engine command line, after the
+	// arguments the operator generates. Use it for anything the spec does not
+	// expose; arguments the operator already set are not duplicated.
+	// +optional
+	ExtraArgs []string `json:"extraArgs,omitempty"`
+}
+
+// GPUSpec describes the GPU resources for one Model.
+type GPUSpec struct {
+	// Count is the number of GPUs requested as nvidia.com/gpu.
+	// Only 1 is supported today; a larger value is rejected by the CRD.
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1
+	// +optional
+	Count int32 `json:"count,omitempty"`
+	// Layers is the number of model layers offloaded to the GPU,
+	// passed to llama.cpp as --n-gpu-layers. 99 offloads every layer of the
+	// small models this operator targets.
+	// +kubebuilder:default=99
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Layers int32 `json:"layers,omitempty"`
 }
 
 // ModelStatus defines the observed state of Model
