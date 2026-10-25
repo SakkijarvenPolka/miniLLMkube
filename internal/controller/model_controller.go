@@ -25,13 +25,16 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -69,6 +72,15 @@ type rolloutState struct {
 type ModelReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// Clientset reads inference Pod logs. The typed client is used because the
+	// controller-runtime client has no log subresource.
+	Clientset kubernetes.Interface
+	// readPodLog replaces the API server log read; it is nil in production and
+	// set by unit tests that cannot serve logs.
+	readPodLog func(ctx context.Context, pod *corev1.Pod) (string, error)
+	// gpuMu guards gpuScans, which is shared by the reconciler's workers.
+	gpuMu    sync.Mutex
+	gpuScans map[types.NamespacedName]gpuScan
 }
 
 // +kubebuilder:rbac:groups=llm.example.io,resources=models,verbs=get;list;watch;create;update;patch;delete
@@ -76,6 +88,8 @@ type ModelReconciler struct {
 // +kubebuilder:rbac:groups=llm.example.io,resources=models/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -137,7 +151,10 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	state := evaluateRollout(deployment, desiredReplicas)
 	state.endpoint = endpointFor(model)
 
-	if err := r.updateStatus(ctx, model, state, deployment.Status.ReadyReplicas); err != nil {
+	// GPU offload is verified from the inference log, so it is only read once
+	// the rollout is complete; gpuConditions returns nil for CPU-only Models.
+	if err := r.updateStatus(ctx, model, state, deployment.Status.ReadyReplicas,
+		r.gpuConditions(ctx, model, state)...); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -208,6 +225,7 @@ func (r *ModelReconciler) updateStatus(
 	model *llmv1alpha1.Model,
 	state rolloutState,
 	readyReplicas int32,
+	extra ...metav1.Condition,
 ) error {
 	before := model.DeepCopy()
 	model.Status.Phase = state.phase
@@ -224,6 +242,14 @@ func (r *ModelReconciler) updateStatus(
 		Reason:             state.reason,
 		Message:            state.message,
 	})
+	for _, condition := range extra {
+		meta.SetStatusCondition(&model.Status.Conditions, condition)
+	}
+	if !wantsGPU(model) {
+		// Drop a stale verdict when the GPU is no longer requested, otherwise the
+		// status keeps claiming an offload the Pod no longer performs.
+		meta.RemoveStatusCondition(&model.Status.Conditions, gpuOffloadConditionType)
+	}
 
 	if reflect.DeepEqual(before.Status, model.Status) {
 		return nil

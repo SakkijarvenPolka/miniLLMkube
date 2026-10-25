@@ -25,6 +25,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -389,6 +390,24 @@ var _ = Describe("Model Controller", func() {
 
 			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
 			Expect(deployment.ResourceVersion).To(Equal(resourceVersion))
+
+			By("dropping the GPU verdict once the Model no longer asks for a GPU")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			model.Spec.GPU = nil
+			Expect(k8sClient.Update(ctx, model)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			Expect(deployment.Spec.Template.Spec.Containers[0].Resources.Limits).NotTo(
+				HaveKey(corev1.ResourceName(gpuResourceName)))
+			Expect(deployment.Spec.Template.Spec.Containers[0].Args).NotTo(ContainElement("-lv"))
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(meta.FindStatusCondition(model.Status.Conditions, gpuOffloadConditionType)).To(BeNil())
 		})
 		It("requests a GPU when spec.gpu is set", func() {
 			Expect(os.Unsetenv(gpuRuntimeClassEnv)).To(Succeed())
@@ -415,6 +434,13 @@ var _ = Describe("Model Controller", func() {
 			Expect(deployment.Spec.Template.Spec.Containers[0].Args).To(ContainElements(
 				"--n-gpu-layers", "99",
 			))
+
+			By("recording GPUOffload as still unknown while the Pod is not ready")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			gpuCondition := meta.FindStatusCondition(model.Status.Conditions, gpuOffloadConditionType)
+			Expect(gpuCondition).NotTo(BeNil())
+			Expect(gpuCondition.Status).To(Equal(metav1.ConditionUnknown))
+			Expect(gpuCondition.Reason).To(Equal(gpuReasonNotDetected))
 
 			By("not rewriting the Deployment on the next reconcile")
 			resourceVersion := deployment.ResourceVersion
