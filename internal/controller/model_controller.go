@@ -43,7 +43,6 @@ import (
 
 const (
 	inferencePort    = 8080
-	defaultImage     = "ghcr.io/ggml-org/llama.cpp:server"
 	downloaderImage  = "curlimages/curl:8.11.1"
 	defaultContext   = 4096
 	progressDeadline = 1800
@@ -335,13 +334,6 @@ func replicasFor(model *llmv1alpha1.Model) int32 {
 	return *model.Spec.Replicas
 }
 
-func imageFor(model *llmv1alpha1.Model) string {
-	if model.Spec.Image == "" {
-		return defaultImage
-	}
-	return model.Spec.Image
-}
-
 func contextSizeFor(model *llmv1alpha1.Model) int32 {
 	if model.Spec.ContextSize == 0 {
 		return defaultContext
@@ -349,13 +341,27 @@ func contextSizeFor(model *llmv1alpha1.Model) int32 {
 	return model.Spec.ContextSize
 }
 
+// serverArgs renders the llama-server command line. Arguments the operator
+// generates are skipped when the user already set them through spec.extraArgs,
+// and the user's arguments always come last so they win on conflicts.
 func serverArgs(model *llmv1alpha1.Model) []string {
-	return []string{
+	args := []string{
 		"--model", modelFilePathFor(model),
 		"--host", "0.0.0.0",
 		"--port", strconv.Itoa(inferencePort),
 		"--ctx-size", strconv.FormatInt(int64(contextSizeFor(model)), 10),
 	}
+	if wantsGPU(model) {
+		if !hasFlag(model.Spec.ExtraArgs, "--n-gpu-layers", "--gpu-layers", "-ngl") {
+			args = append(args, "--n-gpu-layers", strconv.Itoa(int(gpuLayersFor(model))))
+		}
+		// -lv 5 raises the log level so llama.cpp prints the device it loads
+		// the model onto; the GPUOffload condition is parsed from that line.
+		if !hasFlag(model.Spec.ExtraArgs, "--verbosity", "-v", "-lv") {
+			args = append(args, "-lv", gpuVerbosityLevel)
+		}
+	}
+	return append(args, model.Spec.ExtraArgs...)
 }
 
 // usesHostPathCache reports whether the operator was configured with a host
