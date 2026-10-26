@@ -1,0 +1,14 @@
+apiVersion: llm.example.io/v1alpha1
+kind: Model
+metadata:
+  name: qwen3-0-6b-vllm
+spec:
+  source: hf://Qwen/Qwen3-0.6B
+  contextSize: 4096
+  gpu: {}
+  resources:
+    requests:
+      cpu: "2"
+      memory: "8Gi"
+    limits:
+      memory: "8Gi"

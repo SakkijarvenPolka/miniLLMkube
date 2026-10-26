@@ -590,16 +590,16 @@ SchedulerName string              `json:"schedulerName,omitempty"`
 | M2-T2 渲染逻辑 | 已完成 | feat/m1 4c1fac6 | limits 同步镜像进 requests，否则存储模板与渲染结果永不相等（F9）；`-lv 5` 已加（F10） |
 | M2-T3 测试 | 已完成 | feat/m1 d042e51 | pod_builder 表驱动 12 例 + envtest（gpu:{} → limits=1、RuntimeClass=nil、`--n-gpu-layers 99`） |
 | M2-T4 GPU 生效检测 | 已完成 | feat/m1 9903109 | `GPUOffload` 条件 + 按 Pod UID 缓存观测；日志读失败记 Unknown 并打日志，不阻断 reconcile |
-| M3-T0 vLLM 探查 | 未开始 | | tag 用 v0.32.0-cu129；结论回写本节 |
-| M3-T1 API+CEL | 未开始 | | |
-| M3-T2 后端接口 | 未开始 | | |
-| M3-T3 llama.cpp 后端 | 未开始 | | |
-| M3-T4 vLLM 后端 | 未开始 | | |
-| M4-T1 诊断纯函数 | 未开始 | | 可与 M1 并行 |
-| M4-T2 接入 Reconcile | 未开始 | | |
+| M3-T0 vLLM 探查 | 未执行 | | 无集群，未做手动 Pod 探查；镜像 tag 仍固定 `vllm/vllm-openai:v0.32.0-cu129`，`startupFailureThreshold` 取估计值 240 |
+| M3-T1 API+CEL | 已完成 | feat/m3-m4 111fde3 | runtime/format 字段、两条 CEL、status.resolved*、printcolumn Runtime |
+| M3-T2 后端接口 | 已完成 | feat/m3-m4 94453fe | `runtime.go` 的 Backend 接口与 resolveBackend；validateSpec 改为按解析出的格式校验 source |
+| M3-T3 llama.cpp 后端 | 已完成 | feat/m3-m4 94453fe | 迁移 serverArgs 与 GPU 逻辑；绑 `::`；`--alias <CR 名>` |
+| M3-T4 vLLM 后端 | 已完成 | feat/m3-m4 94453fe | 参数/Env/PodMutations/下载脚本；`/dev/shm` 内存卷与 `enableServiceLinks=false` |
+| M4-T1 诊断纯函数 | 已完成 | feat/m3-m4 f84b17a | `diagnose.go` 六级优先级 + 512 字节截断；单测覆盖每级与优先级 |
+| M4-T2 接入 Reconcile | 已完成 | feat/m3-m4 1c16129 | Pod 诊断覆盖状态、Pod watch、Reason 变化发 Warning；envtest 覆盖诊断与事件 |
 | M5 透传字段 | 未开始 | | |
 
-M1、M2 的「集群验收」步骤本次未执行（用户要求暂不上集群），只完成到 `make test` / `make lint` 全绿。验收前需要按各任务节点核对一遍真实集群行为。
+M1、M2、M3、M4 的「集群验收」步骤均未执行（用户要求暂不上集群），只完成到 `make test` / `make lint` 全绿。验收前需要按各任务节点核对一遍真实集群行为；M3-T0 的 vLLM 可行性探查也因无集群未做。
 
 ## 7. 边界问题清单
 
