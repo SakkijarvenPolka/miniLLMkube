@@ -454,6 +454,74 @@ var _ = Describe("Model Controller", func() {
 			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
 			Expect(deployment.ResourceVersion).To(Equal(resourceVersion))
 		})
+
+		It("rejects vllm with gguf weights before storing the object", func() {
+			invalid := &llmv1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: "invalid-runtime", Namespace: typeNamespacedName.Namespace},
+				Spec: llmv1alpha1.ModelSpec{
+					Source:  modelSource,
+					Runtime: runtimeVLLM,
+					Format:  formatGGUF,
+				},
+			}
+			Expect(k8sClient.Create(ctx, invalid)).To(MatchError(ContainSubstring("vllm does not support gguf")))
+		})
+
+		It("resolves the runtime from the source and reports it in status", func() {
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(model.Status.ResolvedRuntime).To(Equal(runtimeLlamaCpp))
+			Expect(model.Status.ResolvedFormat).To(Equal(formatGGUF))
+		})
+
+		It("runs vllm for an hf:// source", func() {
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			model.Spec.Source = testHFSource
+			model.Spec.Image = ""
+			Expect(k8sClient.Update(ctx, model)).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(model.Status.ResolvedRuntime).To(Equal(runtimeVLLM))
+			Expect(model.Status.ResolvedFormat).To(Equal(formatSafetensors))
+
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			podSpec := deployment.Spec.Template.Spec
+
+			Expect(podSpec.Containers[0].Image).To(Equal(vllmImage))
+			Expect(podSpec.Containers[0].Args).To(ContainElements(
+				"--served-model-name", resourceName, "--max-model-len", "4096",
+			))
+			Expect(podSpec.Containers[0].StartupProbe.FailureThreshold).To(Equal(vllmStartupFailureThreshold))
+			Expect(podSpec.EnableServiceLinks).To(HaveValue(BeFalse()))
+
+			By("giving vLLM a memory-backed /dev/shm instead of the 64MiB default")
+			var shm *corev1.Volume
+			for i := range podSpec.Volumes {
+				if podSpec.Volumes[i].Name == sharedMemoryVolumeName {
+					shm = &podSpec.Volumes[i]
+				}
+			}
+			Expect(shm).NotTo(BeNil())
+			Expect(shm.EmptyDir.Medium).To(Equal(corev1.StorageMediumMemory))
+			// 1Gi request, no limit: the fallback size applies.
+			Expect(shm.EmptyDir.SizeLimit.String()).To(Equal(defaultSharedMemorySize))
+
+			By("downloading the repository with the same image")
+			downloader := podSpec.InitContainers[0]
+			Expect(downloader.Image).To(Equal(vllmImage))
+			Expect(downloader.Args[0]).To(Equal(downloadScriptSafetensors))
+			Expect(downloader.Env).To(ContainElement(corev1.EnvVar{Name: "MODEL_REPO", Value: "Qwen/Qwen3-0.6B"}))
+		})
 	})
 })
 

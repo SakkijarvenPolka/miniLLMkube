@@ -40,6 +40,40 @@ func TestDownloadScriptGolden(t *testing.T) {
 	}
 }
 
+// TestDownloadSafetensorsScriptGolden pins the vLLM downloader the same way.
+func TestDownloadSafetensorsScriptGolden(t *testing.T) {
+	golden, err := os.ReadFile(filepath.Join("testdata", "download_safetensors.sh"))
+	if err != nil {
+		t.Fatalf("read golden file: %v", err)
+	}
+	if string(golden) != downloadScriptSafetensors {
+		t.Fatalf("downloadScriptSafetensors drifted from testdata/download_safetensors.sh:\n--- constant ---\n%s\n--- golden ---\n%s",
+			downloadScriptSafetensors, golden)
+	}
+	if strings.Contains(string(golden), "\r") {
+		t.Fatalf("golden file contains CRLF line endings; the init container runs a POSIX shell")
+	}
+}
+
+// TestDownloadSafetensorsScriptContract keeps the vLLM failure contract: the
+// cache is only complete with a config and weights, and a format problem is
+// reported with the prefix the controller classifies on.
+func TestDownloadSafetensorsScriptContract(t *testing.T) {
+	for _, want := range []string{
+		`> /dev/termination-log`,
+		"DOWNLOAD_FAILED",
+		"FORMAT_MISMATCH",
+		`"$MODEL_REPO"`,
+		"config.json",
+		`*.safetensors`,
+		"flock 9",
+	} {
+		if !strings.Contains(downloadScriptSafetensors, want) {
+			t.Fatalf("downloadScriptSafetensors no longer contains %q", want)
+		}
+	}
+}
+
 // TestDownloadScriptContract keeps the failure contract the controller
 // classifies on: every fatal path writes "REASON: message" to the termination
 // log, and the download never bypasses the temporary file.

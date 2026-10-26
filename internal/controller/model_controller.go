@@ -20,11 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"reflect"
-	"strconv"
-	"strings"
 	"sync"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -239,6 +236,15 @@ func (r *ModelReconciler) updateStatus(
 	}
 	model.Status.ReadyReplicas = readyReplicas
 	model.Status.CacheKey = cacheKeyFor(model.Spec.Source)
+	// The resolved backend is an observation: "auto" stays in the spec and the
+	// decision is only reported here (E29).
+	if backend, format, err := resolveBackend(model); err == nil {
+		model.Status.ResolvedRuntime = backend.Name()
+		model.Status.ResolvedFormat = format
+	} else {
+		model.Status.ResolvedRuntime = ""
+		model.Status.ResolvedFormat = ""
+	}
 	model.Status.ObservedGeneration = model.Generation
 	meta.SetStatusCondition(&model.Status.Conditions, metav1.Condition{
 		Type:               readyCondition,
@@ -262,18 +268,15 @@ func (r *ModelReconciler) updateStatus(
 	return r.Status().Patch(ctx, model, client.MergeFrom(before))
 }
 
+// validateSpec resolves the backend first and then checks spec.source against
+// the weights format the backend expects: an https URL ending in .gguf for
+// llama.cpp, an hf://<org>/<repo>[@<revision>] reference for vLLM.
 func validateSpec(model *llmv1alpha1.Model) error {
-	sourceURL, err := url.Parse(model.Spec.Source)
+	_, format, err := resolveBackend(model)
 	if err != nil {
-		return fmt.Errorf("source must be a valid URL: %w", err)
+		return err
 	}
-	if sourceURL.Scheme != "https" {
-		return fmt.Errorf("source must use https scheme")
-	}
-	if !strings.HasSuffix(sourceURL.Path, ".gguf") {
-		return fmt.Errorf("source path must end with .gguf")
-	}
-	return nil
+	return validateSource(model, format)
 }
 
 func evaluateRollout(deployment *appsv1.Deployment, desiredReplicas int32) rolloutState {
@@ -370,29 +373,6 @@ func contextSizeFor(model *llmv1alpha1.Model) int32 {
 		return defaultContext
 	}
 	return model.Spec.ContextSize
-}
-
-// serverArgs renders the llama-server command line. Arguments the operator
-// generates are skipped when the user already set them through spec.extraArgs,
-// and the user's arguments always come last so they win on conflicts.
-func serverArgs(model *llmv1alpha1.Model) []string {
-	args := []string{
-		"--model", modelFilePathFor(model),
-		"--host", "0.0.0.0",
-		"--port", strconv.Itoa(inferencePort),
-		"--ctx-size", strconv.FormatInt(int64(contextSizeFor(model)), 10),
-	}
-	if wantsGPU(model) {
-		if !hasFlag(model.Spec.ExtraArgs, "--n-gpu-layers", "--gpu-layers", "-ngl") {
-			args = append(args, "--n-gpu-layers", strconv.Itoa(int(gpuLayersFor(model))))
-		}
-		// -lv 5 raises the log level so llama.cpp prints the device it loads
-		// the model onto; the GPUOffload condition is parsed from that line.
-		if !hasFlag(model.Spec.ExtraArgs, "--verbosity", "-v", "-lv") {
-			args = append(args, "-lv", gpuVerbosityLevel)
-		}
-	}
-	return append(args, model.Spec.ExtraArgs...)
 }
 
 // usesHostPathCache reports whether the operator was configured with a host

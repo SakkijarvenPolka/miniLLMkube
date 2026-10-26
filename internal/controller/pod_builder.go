@@ -57,23 +57,32 @@ const (
 // the stored one and issues an Update on any difference, so leaving a
 // defaulted field unset would produce one useless Update per reconcile.
 func buildPodSpec(model *llmv1alpha1.Model) corev1.PodSpec {
-	return corev1.PodSpec{
+	// validateSpec rejected every Model whose backend cannot be resolved, so
+	// the llama.cpp fallback only keeps the builder total for direct callers.
+	backend, _, err := resolveBackend(model)
+	if err != nil {
+		backend = llamacppBackend{}
+	}
+
+	spec := corev1.PodSpec{
 		Volumes:          []corev1.Volume{modelVolume()},
-		InitContainers:   initContainersFor(model),
-		Containers:       []corev1.Container{inferenceContainer(model)},
+		InitContainers:   initContainersFor(model, backend),
+		Containers:       []corev1.Container{inferenceContainer(model, backend)},
 		RuntimeClassName: runtimeClassFor(model),
 		SchedulerName:    "default-scheduler", // M5 will pass the user value through
 	}
+	backend.PodMutations(&spec, model)
+	return spec
 }
 
 // initContainersFor returns the init containers in execution order: prepare
 // the cache root first, then download the model file.
-func initContainersFor(model *llmv1alpha1.Model) []corev1.Container {
+func initContainersFor(model *llmv1alpha1.Model, backend Backend) []corev1.Container {
 	var containers []corev1.Container
 	if usesHostPathCache() {
 		containers = append(containers, cachePrepContainer())
 	}
-	return append(containers, downloaderContainer(model))
+	return append(containers, backend.Downloader(model))
 }
 
 // cachePrepContainer hands the mounted cache root to the downloader user. It
@@ -105,10 +114,10 @@ func cachePrepContainer() corev1.Container {
 	}
 }
 
-// downloaderContainer downloads the model file into the per-source cache
+// ggufDownloaderContainer downloads the GGUF file into the per-source cache
 // directory. It runs as uid 100 (the image's user) and therefore only touches
 // the model volume.
-func downloaderContainer(model *llmv1alpha1.Model) corev1.Container {
+func ggufDownloaderContainer(model *llmv1alpha1.Model) corev1.Container {
 	return corev1.Container{
 		Name:            downloaderContainerName,
 		Image:           downloaderImage,
@@ -128,47 +137,48 @@ func downloaderContainer(model *llmv1alpha1.Model) corev1.Container {
 }
 
 // inferenceContainer runs the inference server.
-func inferenceContainer(model *llmv1alpha1.Model) corev1.Container {
+func inferenceContainer(model *llmv1alpha1.Model, backend Backend) corev1.Container {
 	return corev1.Container{
 		Name:            inferenceContainerName,
 		Image:           imageFor(model),
 		ImagePullPolicy: corev1.PullIfNotPresent,
-		Args:            serverArgs(model),
+		Args:            backend.Args(model, backend.ModelPath(model)),
+		Env:             backend.Env(model),
 		Resources:       resourcesFor(model),
 		Ports: []corev1.ContainerPort{{
 			Name: "http", ContainerPort: inferencePort, Protocol: corev1.ProtocolTCP,
 		}},
 		VolumeMounts:             []corev1.VolumeMount{{Name: modelVolumeName, MountPath: modelMountPath}},
-		StartupProbe:             startupProbe(),
-		ReadinessProbe:           readinessProbe(),
+		StartupProbe:             startupProbe(backend.HealthPath(), backend.StartupFailureThreshold()),
+		ReadinessProbe:           readinessProbe(backend.HealthPath()),
 		TerminationMessagePath:   corev1.TerminationMessagePathDefault,
 		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
 	}
 }
 
-// startupProbe waits for the engine to finish loading the model and its CUDA
-// context: 5s x 120 = 10 minutes.
-func startupProbe() *corev1.Probe {
+// startupProbe waits for the engine to finish loading the model. The backend
+// decides the path and how long a cold start may take.
+func startupProbe(path string, failureThreshold int32) *corev1.Probe {
 	return &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 			// Scheme is explicit for the same reason as the counters below: the
 			// API server defaults it to HTTP, and an unset field would make the
 			// stored template differ from the rendered one on every reconcile.
-			Path: "/health", Port: intstr.FromString("http"), Scheme: corev1.URISchemeHTTP,
+			Path: path, Port: intstr.FromString("http"), Scheme: corev1.URISchemeHTTP,
 		}},
-		PeriodSeconds: 5, TimeoutSeconds: 1, SuccessThreshold: 1, FailureThreshold: 120,
+		PeriodSeconds: 5, TimeoutSeconds: 1, SuccessThreshold: 1, FailureThreshold: failureThreshold,
 	}
 }
 
 // readinessProbe keeps the values the API server used to default to
 // (10/3/1/3), so making them explicit does not roll existing Deployments.
-func readinessProbe() *corev1.Probe {
+func readinessProbe(path string) *corev1.Probe {
 	return &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 			// Scheme is explicit for the same reason as the counters below: the
 			// API server defaults it to HTTP, and an unset field would make the
 			// stored template differ from the rendered one on every reconcile.
-			Path: "/health", Port: intstr.FromString("http"), Scheme: corev1.URISchemeHTTP,
+			Path: path, Port: intstr.FromString("http"), Scheme: corev1.URISchemeHTTP,
 		}},
 		PeriodSeconds: 10, TimeoutSeconds: 3, SuccessThreshold: 1, FailureThreshold: 3,
 	}
@@ -247,16 +257,17 @@ func gpuLayersFor(model *llmv1alpha1.Model) int32 {
 	return model.Spec.GPU.Layers
 }
 
-// imageFor picks the engine image. An explicit spec.image always wins; otherwise
-// the GPU engine is used exactly when the Model asks for a GPU.
+// imageFor picks the engine image. An explicit spec.image always wins;
+// otherwise the backend's default for the resolved GPU mode is used.
 func imageFor(model *llmv1alpha1.Model) string {
 	if model.Spec.Image != "" {
 		return model.Spec.Image
 	}
-	if wantsGPU(model) {
-		return defaultGPUImage
+	backend, _, err := resolveBackend(model)
+	if err != nil {
+		backend = llamacppBackend{}
 	}
-	return defaultImage
+	return backend.DefaultImage(wantsGPU(model))
 }
 
 // runtimeClassFor picks the RuntimeClass of the inference Pod. The spec wins,
