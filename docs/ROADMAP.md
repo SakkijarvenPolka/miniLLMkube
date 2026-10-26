@@ -1,6 +1,6 @@
 # miniLLMkube 开发计划（v3，agent 可执行版）：GPU 推理 + vLLM/llama.cpp 双引擎
 
-> 状态：规划文档，尚未改代码。基线提交 `cd79cde`，日期 2026-10-25。
+> 状态：代码实现与审查修复进行中；原始计划基线为 `cd79cde`（2026-10-25），当前进度以第 6 章为准。M3-T0 与各里程碑集群验收尚未执行，不据本地测试宣称 vLLM 已可用。
 > 读者：负责执行开发的 agent。按任务编号推进，一个任务一个提交，完成后更新第 6 章。
 > 本版已把上一版所有「实现时再确认」的事项实测落定（第 2 章 F1~F14，全部带证据）；除第 9 章列出的少数优化项外，任务里的代码与命令可以直接照写执行。
 > 第 7~9 章沿用上一版并小幅修订（E20），各任务按编号引用。
@@ -482,7 +482,7 @@ func resolveBackend(m *Model) (Backend, string /*format*/, error)
 
 1. 显式 `runtime` 优先，`format` 为 auto 时按 runtime 推断。
 2. `runtime=auto` 时：`format=gguf` 或 source 是 https 且以 `.gguf` 结尾 → llamacpp；`format=safetensors` 或 source 以 `hf://` 开头 → vllm；其它返回错误，Reason 为 `InvalidSpec`。
-3. `validateSpec` 改为调用 `resolveBackend`，再按格式校验 source：gguf 要求 https 和 `.gguf` 后缀；safetensors 要求 `hf://<org>/<repo>`，可带 `@<revision>`。
+3. `validateSpec` 调用 `resolveBackend`，再按格式校验 source：gguf 要求主机名非空的 https URL 和 `.gguf` 后缀；safetensors 要求 `hf://<org>/<repo>`，可带 `@<revision>`。随后调用 `validateRuntimeGPU(m *llmv1alpha1.Model) error`：解析为 vLLM 时，`resourcesFor` 渲染的 `nvidia.com/gpu` limit 必须是有效正整数；`gpu: {}` 的零值 Count 仍默认 1，显式 limit 优先。纯 `resolveBackend` 不因无 GPU 而失败。
 
 **M3-T3 llama.cpp 后端**（`runtime_llamacpp.go`）
 
@@ -594,12 +594,19 @@ SchedulerName string              `json:"schedulerName,omitempty"`
 | M3-T1 API+CEL | 已完成 | feat/m3-m4 111fde3 | runtime/format 字段、两条 CEL、status.resolved*、printcolumn Runtime |
 | M3-T2 后端接口 | 已完成 | feat/m3-m4 94453fe | `runtime.go` 的 Backend 接口与 resolveBackend；validateSpec 改为按解析出的格式校验 source |
 | M3-T3 llama.cpp 后端 | 已完成 | feat/m3-m4 94453fe | 迁移 serverArgs 与 GPU 逻辑；绑 `::`；`--alias <CR 名>` |
-| M3-T4 vLLM 后端 | 已完成 | feat/m3-m4 94453fe | 参数/Env/PodMutations/下载脚本；`/dev/shm` 内存卷与 `enableServiceLinks=false` |
+| M3-T4 vLLM 后端 | 代码完成 / 待集群验证 | feat/m3-m4 94453fe（初始实现） | 参数/Env/PodMutations/下载脚本；`/dev/shm` 内存卷与 `enableServiceLinks=false`；T0 未执行，不能视作运行时可用性验收通过 |
 | M4-T1 诊断纯函数 | 已完成 | feat/m3-m4 f84b17a | `diagnose.go` 六级优先级 + 512 字节截断；单测覆盖每级与优先级 |
 | M4-T2 接入 Reconcile | 已完成 | feat/m3-m4 1c16129 | Pod 诊断覆盖状态、Pod watch、Reason 变化发 Warning；envtest 覆盖诊断与事件 |
 | M5 透传字段 | 已完成 | feat/m3-m4 e6ee5bd | `SchedulerName` 留空仍写 `default-scheduler`（F9）；放置字段不进 selector（E28）；外部调度器验收留待上集群 |
 
-M1、M2、M3、M4 的「集群验收」步骤均未执行（用户要求暂不上集群），只完成到 `make test` / `make lint` 全绿。验收前需要按各任务节点核对一遍真实集群行为；M3-T0 的 vLLM 可行性探查也因无集群未做。
+M1、M2、M3、M4 的「集群验收」步骤均未执行（用户要求暂不上集群）。此前实现轮次记录 `make test` / `make lint` 全绿；此记录不替代本轮修复后的测试，也不代表集群验收。本轮只做本地验证、不跑 make、不访问集群、不提交。M3-T0 手动 Pod 探查仍待用户授权集群验证，M3-T4 当前仅为代码完成，CLI/镜像工具、Blackwell 内核、WSL2 pin-memory、冷启动阈值均未在目标集群验证。
+
+### 6.1 本轮审查修复（2026-10-26，工作区未提交）
+
+- GGUF source 拒绝空 Host/Hostname；vLLM 资源校验单独由 `validateRuntimeGPU` 承担，`validateSpec` 接入；解析层保留无 GPU 的后端解析能力。回归覆盖无 GPU 拒绝、`gpu: {}` 和有效 limit 通过、零/负/小数 limit 与仅 requests 拒绝。
+- 下载缓存增加 `.complete` 完成标记，并核验配置、索引全部分片和 tokenizer；未完整成功的目录不能当作缓存命中。source 缓存键不自动追踪可变上游，HF 应固定不可变 commit revision，GGUF 应使用不可变 URL。
+- README 明确非 llama.cpp 的 `GPUOffload=Unknown/NotDetected`、显式 RuntimeClass 在 CPU 模式也透传、llama.cpp 目前仅 GPU/日志 flag 去重，未宣称基础 flag 全部去重。
+- 其余 Reconcile、诊断与 GPU 观测修复以本轮代码和测试为准；本轮没有创建新提交，不为工作区修复编造提交 hash。T0 与全部真实集群行为等待后续授权验证。
 
 ## 7. 边界问题清单
 

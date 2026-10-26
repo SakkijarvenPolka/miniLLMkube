@@ -22,15 +22,15 @@ miniLLMkube 把这些动作收进一个自定义资源里。用户只关心模�
 
 - 使用 `Model` CRD 声明一个推理服务，支持 `llama.cpp`（GGUF）和 vLLM（safetensors）两种后端。
 - `spec.runtime` / `spec.format` 默认 `auto`：能从 `source` 推断的就不用手写，解析结果写进 `status.resolvedRuntime` / `status.resolvedFormat`；`vllm + gguf`、`llamacpp + safetensors` 这类组合会被 CEL 直接拒绝。
-- 校验 `spec.source`：GGUF 必须是 HTTPS URL 且路径以 `.gguf` 结尾；vLLM 用 `hf://<org>/<repo>[@<revision>]`。
-- 通过 initContainer 下载模型，使用 `curlimages/curl:8.11.1`。
-- 每个 `source` 有自己的缓存目录 `/models/<cacheKey>/<文件名>`：`cacheKey` 取 `source` 的 sha256 前 12 位，换模型不会互相覆盖，`status.cacheKey` 会把它暴露出来。
+- 校验 `spec.source`：GGUF 必须是主机名非空的 HTTPS URL 且路径以 `.gguf` 结尾；vLLM 用 `hf://<org>/<repo>[@<revision>]`。
+- 通过 initContainer 下载模型：GGUF 使用 `curlimages/curl:8.11.1`，safetensors 使用固定 vLLM 镜像内的 Hugging Face CLI（镜像实际工具可用性待 T0 核验）。
+- 每个 `source` 有自己的缓存目录 `/models/<cacheKey>/`（GGUF 文件位于该目录内）：`cacheKey` 取 `source` 的 sha256 前 12 位，换模型不会互相覆盖，`status.cacheKey` 会把它暴露出来。
 - 下载时先写 `<文件名>.tmp`，校验通过后再改名，避免半成品模型被主容器读取。
 - 同一缓存目录用 `flock` 串行化：多个副本同时启动时只有一个 Pod 真正下载，其余 Pod 等锁后直接命中。
 - 支持断点续传：已有 `.tmp` 时先 `HEAD` 比对 `Content-Length`，再 `curl -C -` 续传；`EXPECT_FORMAT=gguf` 时会校验 `GGUF` 魔数。
 - 主容器运行 `llama.cpp` server 或 vLLM，并提供 OpenAI 兼容 API；vLLM 会自动给 `/dev/shm` 挂内存卷、关掉 service link 注入（vLLM 会校验未知的 `VLLM_*` 变量）。
-- 下载脚本除了校验 GGUF 魔数，也会校验 vLLM 仓库里 `config.json` 与 `*.safetensors` 是否齐全，缺一即报 `FORMAT_MISMATCH`。
-- 支持 GPU 推理：`spec.gpu` 会请求 `nvidia.com/gpu`、改用 CUDA 镜像、追加 `--n-gpu-layers`，并从推理日志里确认 GPU 是否真的生效。
+- vLLM 下载器仅在完整下载成功并通过配置、权重及分片、tokenizer 检查后写入 `.complete` 完成标记。缓存命中必须有该标记，并重新检查配置、索引引用的全部分片和至少一种非空 tokenizer 文件；缺标记的目录会重新下载，不能只凭 `config.json` 和单个权重文件判定完成。格式不符报 `FORMAT_MISMATCH`。
+- 支持 GPU 资源声明：`spec.gpu` 会请求 `nvidia.com/gpu`；llama.cpp 默认改用 CUDA 镜像、追加 `--n-gpu-layers`，并从推理日志里确认 GPU 是否真的生效。vLLM 必须声明有效 GPU 资源，实际推理可用性待集群验证。
 - 创建 ClusterIP Service，集群内访问地址会写入 `status.endpoint`。
 - 根据 Deployment 状态维护 `Pending`、`Deploying`、`Ready`、`Failed` 阶段。
 - Pod 卡住时会从 Pod 状态里给出原因：`DownloadFailed`、`FormatMismatch`、`ImagePullFailed`、`InsufficientGPU`、`Unschedulable`、`RuntimeCrashing`，并只在原因变化时发一条 Warning 事件。
@@ -75,7 +75,7 @@ spec:
       memory: "4Gi"
 ```
 
-用 vLLM 跑 safetensors 仓库时换成 `hf://`：
+用 vLLM 跑 safetensors 仓库时换成 `hf://`（代码已实现，M3-T0 集群验证仍待执行；建议把下例 source 固定到实际 commit）：
 
 ```yaml
 spec:
@@ -97,16 +97,16 @@ spec:
 
 字段说明：
 
-- `source`：模型来源。GGUF 是 HTTPS 下载地址且 URL path 以 `.gguf` 结尾；vLLM 是 `hf://<org>/<repo>`，可加 `@<revision>` 固定版本。
+- `source`：模型来源。GGUF 是主机名非空的 HTTPS 下载地址且 URL path 以 `.gguf` 结尾；vLLM 是 `hf://<org>/<repo>[@<revision>]`。缓存键只由完整 source 字符串计算，不检测上游可变内容；应使用不可变 GGUF URL 或 `hf://<org>/<repo>@<commit>` 固定 revision。`main` 等可变分支同样可能命中旧缓存；需要升级时修改 source/revision。
 - `runtime`：可选，`auto`（默认）、`llamacpp`、`vllm`。`auto` 时会从 `format` 和 `source` 推断：`.gguf` 结尾或 `format: gguf` 走 llama.cpp，`hf://` 或 `format: safetensors` 走 vLLM，推断不出来直接报 `InvalidSpec`。推断结果只写 status，不改 spec。
 - `format`：可选，`auto`（默认）、`gguf`、`safetensors`。
 - `replicas`：推理 Pod 数量。可以设为 `0`，表示缩容到零。
 - `contextSize`：上下文窗口大小，单位是 token。
 - `image`：可选。留空时按后端和是否请求 GPU 选默认镜像：llama.cpp GPU 用 `ghcr.io/ggml-org/llama.cpp:server-cuda`、CPU 用 `ghcr.io/ggml-org/llama.cpp:server`；vLLM 固定 `vllm/vllm-openai:v0.32.0-cu129`。
 - `resources`：推理容器的 CPU/内存请求和限制。建议显式配置，避免模型进程因为资源不足被 OOM Kill。
-- `gpu`：可选。写 `gpu: {}` 即请求一张 GPU（`count` 默认 1、上限 1），`layers` 默认 99，会翻译成 `--n-gpu-layers 99`；不想让 Cluster 里的 GPU 设备插件介入时就不写这一节。
-- `runtimeClassName`：可选。GPU 场景一般填 `nvidia`。留空时，只有在请求 GPU 的情况下才会回落到 controller 的环境变量 `GPU_RUNTIME_CLASS`；CPU 模式永远不加 `runtimeClassName`。
-- `extraArgs`：可选。透传给推理进程的额外参数，永远追加在最后；operator 生成参数前会检查同名 flag（`--x` 与 `--x=v` 都认），用户写过的就不再追加。
+- `gpu`：llama.cpp 可选；vLLM 必须设置 `gpu: {}` 或有效正整数 `resources.limits["nvidia.com/gpu"]`。写 `gpu: {}` 即请求一张 GPU（`count` 默认 1、上限 1）；`layers` 仅对 llama.cpp 生效，默认 99，翻译成 `--n-gpu-layers 99`。显式 GPU limit 优先，不会被 `gpu` 覆盖，零值、负值和小数不满足 vLLM 的 GPU 要求。
+- `runtimeClassName`：可选。显式值始终透传（CPU 模式也一样）；GPU 场景一般填 `nvidia`。未设置时，只有请求 GPU 才会回落到 controller 的环境变量 `GPU_RUNTIME_CLASS`；CPU 模式不使用该环境变量。
+- `extraArgs`：可选。原样追加在推理进程参数末尾。vLLM 对其自动生成的同名长 flag 去重（识别 `--x v` 与 `--x=v`）；llama.cpp 目前只对 GPU 层数及日志级别 flag（含已支持别名）去重，基础 flag 如 `--model`、`--host`、`--ctx-size` 仍可能重复。不要依赖所有参数都能安全覆盖。
 - `nodeSelector` / `tolerations` / `affinity`：可选。原样写进 Pod 模板，用来把推理 Pod 钉到特定节点（GPU 型号、专用节点池、污点容忍）。
 - `schedulerName`：可选。留给外部调度器（比如自研 GPU 调度插件）；留空时仍用集群默认的 `default-scheduler`。
 
@@ -225,7 +225,7 @@ kubectl apply -f config/samples/llm_v1alpha1_model.yaml
 - `False` / `CPUFallback`：镜像已经启动，但 llama.cpp 退回了 CPU（例如驱动或 RuntimeClass 没配好）。这是最容易踩的坑：Pod 是 Ready 的，速度却只有 CPU 水平。
 - `Unknown` / `NotDetected`：Pod 还没 Ready、日志里还没有设备行，或者日志读不到。
 
-vLLM 没有 `GPUOffload` 条件：它启动失败通常是显存不足，会落到 `RuntimeCrashing`。
+请求 GPU 的非 llama.cpp 后端（包括 vLLM）仍保留 `GPUOffload` 条件，但为 `Unknown` / `NotDetected`，表示此检测器不支持该后端，并不表示 GPU 未使用。vLLM 启动失败（如显存不足）可落到 `RuntimeCrashing`。
 
 可以通过下面命令查看更详细的 condition：
 
@@ -297,7 +297,7 @@ kind delete cluster --name llmops
 
 - 暂未做多模型路由。
 - GPU 只做到「资源请求 + RuntimeClass 透传 + 日志确认」，不感知显卡型号、驱动版本，也不做多卡切分；GPU 副本目前按 `Recreate` 更新，避免旧 Pod 占着显卡不放。
-- vLLM 后端只在一个 12GB 单卡环境上试过参数，`--gpu-memory-utilization` 固定 0.85，没有做显存自适应；WSL2 下需要 operator 环境变量 `ENABLE_WSL2_VLLM_PIN_MEMORY=true` 才会注入 `VLLM_WSL2_ENABLE_PIN_MEMORY=1`。
+- vLLM 后端代码已实现，但 M3-T0 的 Blackwell + WSL2 手动 Pod 探查和集群推理验收尚未执行；不能把参数渲染/本地测试通过当作后端实际可用性证据。固定镜像的 CLI、CUDA 内核和 WSL2 pin-memory 行为均待 T0 核验。启动探针目前是估计值 240 × 5s（20 分钟）；`--gpu-memory-utilization` 固定 0.85，未做显存自适应。operator 环境变量 `ENABLE_WSL2_VLLM_PIN_MEMORY=true` 才会注入 `VLLM_WSL2_ENABLE_PIN_MEMORY=1`。
 - 放置字段（`nodeSelector` / `tolerations` / `affinity` / `schedulerName`）只透传不校验：填错 `nodeSelector` 会表现成 `Unschedulable`，不会在 admission 阶段被拒绝。
 - 暂未提供 Helm Chart。
 

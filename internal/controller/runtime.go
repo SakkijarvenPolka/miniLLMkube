@@ -154,8 +154,34 @@ func validateSource(model *llmv1alpha1.Model, format string) error {
 	if sourceURL.Scheme != "https" {
 		return fmt.Errorf("source must use https scheme")
 	}
+	if sourceURL.Host == "" || sourceURL.Hostname() == "" {
+		return fmt.Errorf("source host must not be empty")
+	}
 	if !strings.HasSuffix(sourceURL.Path, ggufSuffix) {
 		return fmt.Errorf("source path must end with %s", ggufSuffix)
+	}
+	return nil
+}
+
+// validateRuntimeGPU enforces the runtime-specific GPU contract. vLLM always
+// runs on CUDA and therefore requires either the explicit spec.gpu block or a
+// positive nvidia.com/gpu limit. resolveBackend intentionally remains a pure
+// parser: callers may still inspect a vLLM backend without GPU resources.
+func validateRuntimeGPU(model *llmv1alpha1.Model) error {
+	backend, _, err := resolveBackend(model)
+	if err != nil {
+		return err
+	}
+	if backend.Name() != runtimeVLLM {
+		return nil
+	}
+	// resourcesFor defaults an omitted gpu.count to one, but preserves an
+	// explicit resource limit. A zero/negative limit must not be hidden by
+	// spec.gpu, because the rendered Pod would still have no usable GPU.
+	gpuLimit, found := resourcesFor(model).Limits[corev1.ResourceName(gpuResourceName)]
+	count, integer := gpuLimit.AsInt64()
+	if !found || !integer || count <= 0 {
+		return fmt.Errorf("vllm requires a positive %s limit or spec.gpu", gpuResourceName)
 	}
 	return nil
 }

@@ -19,6 +19,7 @@ package controller
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -154,8 +155,8 @@ func TestDiagnosePodsTruncatesLongMessages(t *testing.T) {
 	if got == nil {
 		t.Fatal("diagnosePods() = nil, want a diagnosis")
 	}
-	if len(got.message) > diagnosisMessageLimit+len("...") {
-		t.Errorf("message length = %d, want at most %d", len(got.message), diagnosisMessageLimit+len("..."))
+	if len(got.message) > diagnosisMessageLimit {
+		t.Errorf("message length = %d, want at most %d", len(got.message), diagnosisMessageLimit)
 	}
 	if !strings.HasSuffix(got.message, "...") {
 		t.Errorf("message = %q, want a truncation marker", got.message)
@@ -240,5 +241,60 @@ func crashingTestPod(message string) corev1.Pod {
 				},
 			}},
 		},
+	}
+}
+
+func TestDownloaderDiagnosisCurrentState(t *testing.T) {
+	old := &corev1.ContainerStateTerminated{ExitCode: 1, Message: "FORMAT_MISMATCH: stale format"}
+	tests := []struct {
+		name        string
+		state       corev1.ContainerState
+		wantReason  string
+		wantMessage string
+	}{
+		{name: "running retry ignores stale failure", state: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
+		{name: "successful retry ignores stale failure", state: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}},
+		{name: "current failure wins over stale format", state: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 22, Message: "current timeout"}}, wantReason: reasonDownloadFailed, wantMessage: "current timeout"},
+		{name: "current format wins over stale format", state: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Message: "FORMAT_MISMATCH: current format"}}, wantReason: reasonFormatMismatch, wantMessage: "current format"},
+		{name: "waiting retry retains last failure", state: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: crashLoopReason}}, wantReason: reasonFormatMismatch, wantMessage: "stale format"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := downloaderTestPod("retry", tt.state)
+			pod.Status.InitContainerStatuses[0].LastTerminationState.Terminated = old
+			got := diagnosePods([]corev1.Pod{pod})
+			if tt.wantReason == "" {
+				if got != nil {
+					t.Fatalf("diagnosePods() = %+v, want nil", got)
+				}
+				return
+			}
+			if got == nil || got.reason != tt.wantReason || !strings.Contains(got.message, tt.wantMessage) {
+				t.Fatalf("diagnosePods() = %+v, want %s containing %q", got, tt.wantReason, tt.wantMessage)
+			}
+		})
+	}
+}
+
+func TestTruncateDiagnosisMessage(t *testing.T) {
+	for _, message := range []string{
+		strings.Repeat("a", diagnosisMessageLimit),
+		strings.Repeat("a", diagnosisMessageLimit+1),
+		strings.Repeat("中", diagnosisMessageLimit),
+		strings.Repeat("a", diagnosisMessageLimit-4) + "中文",
+		strings.Repeat(" ", diagnosisMessageLimit+1),
+		"bad\xffUTF8",
+		strings.Repeat("\xff", diagnosisMessageLimit),
+	} {
+		got := truncateDiagnosisMessage(message)
+		if len(got) > diagnosisMessageLimit || !utf8.ValidString(got) {
+			t.Errorf("invalid truncated message: len=%d validUTF8=%v", len(got), utf8.ValidString(got))
+		}
+		if utf8.ValidString(message) && len(message) <= diagnosisMessageLimit && got != message {
+			t.Errorf("short message changed: got %q", got)
+		}
+		if len(message) > diagnosisMessageLimit && !strings.HasSuffix(got, "...") {
+			t.Errorf("truncated message lacks marker: %q", got)
+		}
 	}
 }

@@ -483,6 +483,7 @@ var _ = Describe("Model Controller", func() {
 			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
 			model.Spec.Source = testHFSource
 			model.Spec.Image = ""
+			model.Spec.GPU = &llmv1alpha1.GPUSpec{Count: 1, Layers: 99}
 			Expect(k8sClient.Update(ctx, model)).To(Succeed())
 
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -533,12 +534,32 @@ var _ = Describe("Model Controller", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("creating the Pod the kubelet would report after a failed download")
+			By("creating the current ReplicaSet and Pod the kubelet would report after a failed download")
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			rs := &appsv1.ReplicaSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName + "-diagnosed-rs",
+					Namespace: testNamespace,
+					Labels:    labelsFor(model),
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(
+						deployment, appsv1.SchemeGroupVersion.WithKind("Deployment"),
+					)},
+				},
+				Spec: appsv1.ReplicaSetSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: labelsFor(model)},
+					Template: *deployment.Spec.Template.DeepCopy(),
+				},
+			}
+			Expect(k8sClient.Create(ctx, rs)).To(Succeed())
 			pod := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      resourceName + "-diagnosed",
 					Namespace: testNamespace,
 					Labels:    labelsFor(model),
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(
+						rs, appsv1.SchemeGroupVersion.WithKind("ReplicaSet"),
+					)},
 				},
 				Spec: corev1.PodSpec{Containers: []corev1.Container{{
 					Name:  inferenceContainerName,

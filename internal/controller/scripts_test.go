@@ -66,6 +66,16 @@ func TestDownloadSafetensorsScriptContract(t *testing.T) {
 		`"$MODEL_REPO"`,
 		"config.json",
 		`*.safetensors`,
+		"safetensors.index.json",
+		"python3",
+		"tokenizer.json",
+		"tokenizer.model",
+		"vocab.json",
+		"vocab.txt",
+		"spiece.model",
+		"sentencepiece.bpe.model",
+		`COMPLETE="$MODEL_DIR/.complete"`,
+		`mv -f "$MARKER_TMP" "$COMPLETE"`,
 		"flock 9",
 	} {
 		if !strings.Contains(downloadScriptSafetensors, want) {

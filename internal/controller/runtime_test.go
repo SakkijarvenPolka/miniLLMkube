@@ -125,6 +125,9 @@ func TestValidateSource(t *testing.T) {
 	}{
 		{name: "gguf url", source: testModelSource, format: formatGGUF},
 		{name: "gguf url with query", source: testModelSource + "?download=true", format: formatGGUF},
+		{name: "gguf with empty host", source: "https:///model.gguf", format: formatGGUF, wantErr: true},
+		{name: "gguf with empty hostname", source: "https://:443/model.gguf", format: formatGGUF, wantErr: true},
+		{name: "gguf with opaque url", source: "https:model.gguf", format: formatGGUF, wantErr: true},
 		{name: "gguf with http", source: "http://example.com/model.gguf", format: formatGGUF, wantErr: true},
 		{name: "gguf without suffix", source: testNonGGUFURL, format: formatGGUF, wantErr: true},
 		{name: "hf repository", source: testHFSource, format: formatSafetensors},
@@ -146,6 +149,40 @@ func TestValidateSource(t *testing.T) {
 			}
 			if !test.wantErr && err != nil {
 				t.Fatalf("validateSource(%q) error = %v", test.source, err)
+			}
+		})
+	}
+}
+
+func TestValidateSpecRuntimeGPU(t *testing.T) {
+	gpuLimit := func(value string) corev1.ResourceRequirements {
+		return corev1.ResourceRequirements{Limits: corev1.ResourceList{
+			corev1.ResourceName(gpuResourceName): resource.MustParse(value),
+		}}
+	}
+	tests := []struct {
+		name    string
+		spec    llmv1alpha1.ModelSpec
+		wantErr bool
+	}{
+		{name: "inferred vllm without gpu", spec: llmv1alpha1.ModelSpec{Source: testHFSource}, wantErr: true},
+		{name: "explicit vllm without gpu", spec: llmv1alpha1.ModelSpec{Source: testHFSource, Runtime: runtimeVLLM}, wantErr: true},
+		{name: "vllm with empty gpu block", spec: llmv1alpha1.ModelSpec{Source: testHFSource, GPU: &llmv1alpha1.GPUSpec{}}},
+		{name: "vllm with gpu count", spec: llmv1alpha1.ModelSpec{Source: testHFSource, GPU: &llmv1alpha1.GPUSpec{Count: 1}}},
+		{name: "vllm with gpu limit", spec: llmv1alpha1.ModelSpec{Source: testHFSource, Resources: gpuLimit("1")}},
+		{name: "vllm with zero gpu limit", spec: llmv1alpha1.ModelSpec{Source: testHFSource, Resources: gpuLimit("0")}, wantErr: true},
+		{name: "vllm with negative gpu limit", spec: llmv1alpha1.ModelSpec{Source: testHFSource, Resources: gpuLimit("-1")}, wantErr: true},
+		{name: "vllm with fractional gpu limit", spec: llmv1alpha1.ModelSpec{Source: testHFSource, Resources: gpuLimit("500m")}, wantErr: true},
+		{name: "explicit zero limit wins over gpu block", spec: llmv1alpha1.ModelSpec{Source: testHFSource, GPU: &llmv1alpha1.GPUSpec{}, Resources: gpuLimit("0")}, wantErr: true},
+		{name: "gpu request only is not a limit", spec: llmv1alpha1.ModelSpec{Source: testHFSource, Resources: corev1.ResourceRequirements{Requests: gpuLimit("1").Limits}}, wantErr: true},
+		{name: "llamacpp without gpu", spec: llmv1alpha1.ModelSpec{Source: testModelSource}},
+		{name: "gguf without host", spec: llmv1alpha1.ModelSpec{Source: "https:///model.gguf"}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			model := testModel(test.spec)
+			if err := validateSpec(model); (err != nil) != test.wantErr {
+				t.Fatalf("validateSpec() error = %v, wantErr %v", err, test.wantErr)
 			}
 		})
 	}

@@ -26,6 +26,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -97,6 +98,7 @@ type ModelReconciler struct {
 // +kubebuilder:rbac:groups=llm.example.io,resources=models/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=llm.example.io,resources=models/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
@@ -163,9 +165,11 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	state.endpoint = endpointFor(model)
 	// A Pod that cannot start never becomes ready, so the Deployment keeps
 	// reporting progress forever; the Pod status holds the actual reason.
-	state = r.withPodDiagnosis(ctx, model, state)
-
-	previousReason := readyConditionReason(model)
+	var diagnosisErr error
+	state, diagnosisErr = r.withPodDiagnosis(ctx, model, state)
+	if diagnosisErr != nil {
+		return ctrl.Result{}, diagnosisErr
+	}
 
 	// GPU offload is verified from the inference log, so it is only read once
 	// the rollout is complete; gpuConditions returns nil for CPU-only Models.
@@ -173,43 +177,80 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		r.gpuConditions(ctx, model, state)...); err != nil {
 		return ctrl.Result{}, err
 	}
-	r.recordFailureEvent(ctx, model, state, previousReason)
 
 	return ctrl.Result{}, nil
 }
 
 // withPodDiagnosis replaces the generic rollout state with the Pod-level failure
-// diagnosis when there is one. It is best effort: a List error leaves the
-// Deployment-derived state untouched instead of failing the reconcile.
+// diagnosis when there is one. API errors are returned so the work queue retries
+// rather than permanently hiding a Pod failure behind a generic rollout state.
 func (r *ModelReconciler) withPodDiagnosis(
 	ctx context.Context,
 	model *llmv1alpha1.Model,
 	state rolloutState,
-) rolloutState {
+) (rolloutState, error) {
 	if state.phase == phaseReady {
-		return state
+		return state, nil
 	}
 
-	pods := &corev1.PodList{}
-	if err := r.List(ctx, pods,
-		client.InNamespace(model.Namespace),
-		client.MatchingLabels(labelsFor(model)),
-	); err != nil {
-		logf.FromContext(ctx).Error(err, "Failed to list inference Pods for diagnosis",
-			"name", model.Name)
-		return state
+	pods, err := r.currentInferencePods(ctx, model)
+	if err != nil {
+		return state, err
 	}
 
-	diagnosis := diagnosePods(pods.Items)
+	diagnosis := diagnosePods(pods)
 	if diagnosis == nil {
-		return state
+		return state, nil
 	}
 
 	state.phase = phaseFailed
 	state.status = metav1.ConditionFalse
 	state.reason = diagnosis.reason
 	state.message = diagnosis.message
-	return state
+	return state, nil
+}
+
+// currentInferencePods follows the controller owner chain and the desired Pod
+// template, never a mutable label or an old Deployment revision alone. Before
+// the Deployment controller creates the matching ReplicaSet the result is empty.
+func (r *ModelReconciler) currentInferencePods(ctx context.Context, model *llmv1alpha1.Model) ([]corev1.Pod, error) {
+	deployment := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), deployment); err != nil {
+		return nil, client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(deployment, model) {
+		return nil, nil
+	}
+	replicaSets := &appsv1.ReplicaSetList{}
+	if err := r.List(ctx, replicaSets, client.InNamespace(model.Namespace), client.MatchingLabels(labelsFor(model))); err != nil {
+		return nil, err
+	}
+	current := make(map[types.UID]bool)
+	for i := range replicaSets.Items {
+		rs := &replicaSets.Items[i]
+		if rs.DeletionTimestamp == nil && metav1.IsControlledBy(rs, deployment) && samePodTemplate(rs.Spec.Template, deployment.Spec.Template) {
+			current[rs.UID] = true
+		}
+	}
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(model.Namespace), client.MatchingLabels(labelsFor(model))); err != nil {
+		return nil, err
+	}
+	result := make([]corev1.Pod, 0, len(pods.Items))
+	for _, pod := range pods.Items {
+		owner := metav1.GetControllerOf(&pod)
+		if pod.DeletionTimestamp == nil && owner != nil && owner.APIVersion == appsv1.SchemeGroupVersion.String() && owner.Kind == "ReplicaSet" && current[owner.UID] {
+			result = append(result, pod)
+		}
+	}
+	return result, nil
+}
+
+func samePodTemplate(a, b corev1.PodTemplateSpec) bool {
+	left, right := a.DeepCopy(), b.DeepCopy()
+	delete(left.Labels, appsv1.DefaultDeploymentUniqueLabelKey)
+	delete(right.Labels, appsv1.DefaultDeploymentUniqueLabelKey)
+	return equality.Semantic.DeepEqual(left, right)
 }
 
 // readyConditionReason returns the Reason currently stored on the Ready
@@ -291,7 +332,10 @@ func (r *ModelReconciler) reconcileDeployment(
 		if wantsGPU(model) {
 			deployment.Spec.Strategy = appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType}
 		} else {
-			deployment.Spec.Strategy = appsv1.DeploymentStrategy{Type: appsv1.RollingUpdateDeploymentStrategyType}
+			deployment.Spec.Strategy = appsv1.DeploymentStrategy{
+				Type:          appsv1.RollingUpdateDeploymentStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDeployment{MaxUnavailable: pointerTo(intstr.FromString("25%")), MaxSurge: pointerTo(intstr.FromString("25%"))},
+			}
 		}
 		deployment.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
 		deployment.Spec.Template.Labels = labels
@@ -334,6 +378,7 @@ func (r *ModelReconciler) updateStatus(
 	extra ...metav1.Condition,
 ) error {
 	before := model.DeepCopy()
+	previousReason := readyConditionReason(before)
 	model.Status.Phase = state.phase
 	if state.endpoint != "" {
 		model.Status.Endpoint = state.endpoint
@@ -355,7 +400,7 @@ func (r *ModelReconciler) updateStatus(
 		Status:             state.status,
 		ObservedGeneration: model.Generation,
 		Reason:             state.reason,
-		Message:            state.message,
+		Message:            truncateDiagnosisMessage(state.message),
 	})
 	for _, condition := range extra {
 		meta.SetStatusCondition(&model.Status.Conditions, condition)
@@ -369,7 +414,11 @@ func (r *ModelReconciler) updateStatus(
 	if reflect.DeepEqual(before.Status, model.Status) {
 		return nil
 	}
-	return r.Status().Patch(ctx, model, client.MergeFrom(before))
+	if err := r.Status().Patch(ctx, model, client.MergeFrom(before)); err != nil {
+		return err
+	}
+	r.recordFailureEvent(ctx, model, state, previousReason)
+	return nil
 }
 
 // validateSpec resolves the backend first and then checks spec.source against
@@ -380,7 +429,10 @@ func validateSpec(model *llmv1alpha1.Model) error {
 	if err != nil {
 		return err
 	}
-	return validateSource(model, format)
+	if err := validateSource(model, format); err != nil {
+		return err
+	}
+	return validateRuntimeGPU(model)
 }
 
 func evaluateRollout(deployment *appsv1.Deployment, desiredReplicas int32) rolloutState {

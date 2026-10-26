@@ -106,25 +106,27 @@ func downloaderDiagnosis(pod *corev1.Pod) (diagnosis, int, bool) {
 	if !ok {
 		return diagnosis{}, 0, false
 	}
-
-	states := []*corev1.ContainerStateTerminated{
-		status.LastTerminationState.Terminated,
-		status.State.Terminated,
+	// LastTerminationState is historical. A current running or successful
+	// termination must not resurrect an old download error.
+	if status.State.Running != nil {
+		return diagnosis{}, 0, false
 	}
-	for _, terminated := range states {
-		if terminated == nil {
-			continue
+	terminated := status.State.Terminated
+	if terminated == nil && status.State.Waiting != nil {
+		terminated = status.LastTerminationState.Terminated
+	}
+	if terminated == nil {
+		return diagnosis{}, 0, false
+	}
+	message := strings.TrimSpace(terminated.Message)
+	if strings.HasPrefix(message, formatMismatchPrefix) {
+		return diagnosis{reason: reasonFormatMismatch, message: message}, 1, true
+	}
+	if terminated.ExitCode != 0 {
+		if message == "" {
+			message = fmt.Sprintf("%s exited with code %d", downloaderContainerName, terminated.ExitCode)
 		}
-		message := strings.TrimSpace(terminated.Message)
-		if strings.HasPrefix(message, formatMismatchPrefix) {
-			return diagnosis{reason: reasonFormatMismatch, message: message}, 1, true
-		}
-		if terminated.ExitCode != 0 {
-			if message == "" {
-				message = fmt.Sprintf("%s exited with code %d", downloaderContainerName, terminated.ExitCode)
-			}
-			return diagnosis{reason: reasonDownloadFailed, message: message}, 2, true
-		}
+		return diagnosis{reason: reasonDownloadFailed, message: message}, 2, true
 	}
 	return diagnosis{}, 0, false
 }
@@ -213,13 +215,21 @@ func containerStatus(pod *corev1.Pod, name string) (corev1.ContainerStatus, bool
 // rune boundary, so a status update never carries a multi-KiB termination
 // message.
 func truncateDiagnosisMessage(message string) string {
+	const marker = "..."
+	if utf8.ValidString(message) && len(message) <= diagnosisMessageLimit {
+		return message
+	}
+	if !utf8.ValidString(message) {
+		message = strings.ToValidUTF8(message, "�")
+	}
 	if len(message) <= diagnosisMessageLimit {
 		return message
 	}
-
-	cut := diagnosisMessageLimit
+	// Reserve bytes for the marker; trim at a rune boundary and ensure the
+	// complete result, including marker, is strictly within 512 bytes.
+	cut := diagnosisMessageLimit - len(marker)
 	for cut > 0 && !utf8.RuneStart(message[cut]) {
 		cut--
 	}
-	return strings.TrimSpace(message[:cut]) + "..."
+	return strings.TrimSpace(message[:cut]) + marker
 }
