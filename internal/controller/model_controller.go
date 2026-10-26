@@ -187,6 +187,11 @@ func (r *ModelReconciler) reconcileDeployment(
 		deployment.Labels = labels
 		deployment.Spec.Replicas = pointerTo(replicasFor(model))
 		deployment.Spec.ProgressDeadlineSeconds = pointerTo(int32(progressDeadline))
+		if wantsGPU(model) {
+			deployment.Spec.Strategy = appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType}
+		} else {
+			deployment.Spec.Strategy = appsv1.DeploymentStrategy{Type: appsv1.RollingUpdateDeploymentStrategyType}
+		}
 		deployment.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
 		deployment.Spec.Template.Labels = labels
 		// Only the fields this operator owns are assigned; see applyPodSpec.

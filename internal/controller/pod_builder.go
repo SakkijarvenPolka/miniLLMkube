@@ -86,9 +86,10 @@ func initContainersFor(model *llmv1alpha1.Model) []corev1.Container {
 // itself — root only holds CHOWN here, not DAC_OVERRIDE.
 func cachePrepContainer() corev1.Container {
 	return corev1.Container{
-		Name:    cachePrepContainerName,
-		Image:   downloaderImage,
-		Command: []string{"chown", "100:101", modelMountPath},
+		Name:         cachePrepContainerName,
+		Image:        downloaderImage,
+		Command:      []string{"chown", "100:101", modelMountPath},
+		VolumeMounts: []corev1.VolumeMount{{Name: modelVolumeName, MountPath: modelMountPath}},
 		SecurityContext: &corev1.SecurityContext{
 			RunAsUser:                pointerTo(int64(0)),
 			RunAsNonRoot:             pointerTo(false),

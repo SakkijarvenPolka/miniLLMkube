@@ -109,6 +109,7 @@ var _ = Describe("Model Controller", func() {
 			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
 			Expect(deployment.Spec.Replicas).To(HaveValue(Equal(int32(1))))
 			Expect(deployment.Spec.ProgressDeadlineSeconds).To(HaveValue(Equal(int32(1800))))
+			Expect(deployment.Spec.Strategy.Type).To(Equal(appsv1.RollingUpdateDeploymentStrategyType))
 			Expect(deployment.Spec.Template.Spec.Volumes).To(HaveLen(1))
 			Expect(deployment.Spec.Template.Spec.Volumes[0].EmptyDir).NotTo(BeNil())
 			Expect(deployment.Spec.Template.Spec.Volumes[0].HostPath).To(BeNil())
@@ -183,6 +184,7 @@ var _ = Describe("Model Controller", func() {
 			cachePrep := deployment.Spec.Template.Spec.InitContainers[0]
 			Expect(cachePrep.Name).To(Equal("cache-prep"))
 			Expect(cachePrep.Command).To(Equal([]string{"chown", "100:101", "/models"}))
+			Expect(cachePrep.VolumeMounts).To(ConsistOf(corev1.VolumeMount{Name: modelVolumeName, MountPath: modelMountPath}))
 			Expect(cachePrep.SecurityContext).NotTo(BeNil())
 			Expect(cachePrep.SecurityContext.RunAsUser).To(HaveValue(Equal(int64(0))))
 			Expect(cachePrep.SecurityContext.RunAsNonRoot).To(HaveValue(BeFalse()))
@@ -426,6 +428,7 @@ var _ = Describe("Model Controller", func() {
 
 			// No RuntimeClass comes from the environment here, so the Pod stays
 			// on the cluster default and is scheduled by the resource request.
+			Expect(deployment.Spec.Strategy.Type).To(Equal(appsv1.RecreateDeploymentStrategyType))
 			Expect(deployment.Spec.Template.Spec.RuntimeClassName).To(BeNil())
 			Expect(deployment.Spec.Template.Spec.Containers[0].Resources.Limits).To(HaveKeyWithValue(
 				corev1.ResourceName(gpuResourceName), resource.MustParse("1"),
