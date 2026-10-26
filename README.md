@@ -23,9 +23,12 @@ miniLLMkube 把这些动作收进一个自定义资源里。用户只关心模�
 - 使用 `Model` CRD 声明一个 GGUF 模型推理服务。
 - 校验 `spec.source`：必须是 HTTPS URL，路径以 `.gguf` 结尾。
 - 通过 initContainer 下载模型，使用 `curlimages/curl:8.11.1`。
-- 下载时先写入 `/models/model.gguf.tmp`，成功后再移动为 `/models/model.gguf`，避免半成品模型被主容器读取。
-- 如果 `/models/model.gguf` 已存在且非空，会跳过下载，方便 Pod 重启时复用模型文件。
+- 每个 `source` 有自己的缓存目录 `/models/<cacheKey>/<文件名>`：`cacheKey` 取 `source` 的 sha256 前 12 位，换模型不会互相覆盖，`status.cacheKey` 会把它暴露出来。
+- 下载时先写 `<文件名>.tmp`，校验通过后再改名，避免半成品模型被主容器读取。
+- 同一缓存目录用 `flock` 串行化：多个副本同时启动时只有一个 Pod 真正下载，其余 Pod 等锁后直接命中。
+- 支持断点续传：已有 `.tmp` 时先 `HEAD` 比对 `Content-Length`，再 `curl -C -` 续传；`EXPECT_FORMAT=gguf` 时会校验 `GGUF` 魔数。
 - 主容器运行 `llama.cpp` server，并提供 OpenAI 兼容 API。
+- 支持 GPU 推理：`spec.gpu` 会请求 `nvidia.com/gpu`、改用 CUDA 镜像、追加 `--n-gpu-layers`，并从推理日志里确认 GPU 是否真的生效。
 - 创建 ClusterIP Service，集群内访问地址会写入 `status.endpoint`。
 - 根据 Deployment 状态维护 `Pending`、`Deploying`、`Ready`、`Failed` 阶段。
 - 支持通过 `MODEL_CACHE_HOST_PATH` 在开发环境复用宿主机上的模型缓存。
@@ -40,8 +43,8 @@ Model Controller
    |
    +--> Deployment
    |      |
-   |      +--> initContainer: 下载 GGUF 到 /models/model.gguf
-   |      +--> llama.cpp server: 加载 /models/model.gguf
+   |      +--> initContainer: 下载 GGUF 到 /models/<cacheKey>/<文件名>
+   |      +--> llama.cpp server: 加载同一路径
    |
    +--> Service: 暴露 8080 端口
    |
@@ -69,13 +72,25 @@ spec:
       memory: "4Gi"
 ```
 
+需要 GPU 时加一段 `gpu`：
+
+```yaml
+spec:
+  gpu:
+    count: 1     # 目前上限为 1
+    layers: 99   # 对应 --n-gpu-layers，99 表示全部层卸载
+```
+
 字段说明：
 
 - `source`：GGUF 模型文件下载地址。必须是 HTTPS，并且 URL path 以 `.gguf` 结尾。
 - `replicas`：推理 Pod 数量。可以设为 `0`，表示缩容到零。
 - `contextSize`：上下文窗口大小，单位是 token。
-- `image`：可选。默认使用 `ghcr.io/ggml-org/llama.cpp:server`。
+- `image`：可选。留空时按是否请求 GPU 选默认镜像：GPU 用 `ghcr.io/ggml-org/llama.cpp:server-cuda`，CPU 用 `ghcr.io/ggml-org/llama.cpp:server`。
 - `resources`：推理容器的 CPU/内存请求和限制。建议显式配置，避免模型进程因为资源不足被 OOM Kill。
+- `gpu`：可选。写 `gpu: {}` 即请求一张 GPU（`count` 默认 1、上限 1），`layers` 默认 99，会翻译成 `--n-gpu-layers 99`；不想让 Cluster 里的 GPU 设备插件介入时就不写这一节。
+- `runtimeClassName`：可选。GPU 场景一般填 `nvidia`。留空时，只有在请求 GPU 的情况下才会回落到 controller 的环境变量 `GPU_RUNTIME_CLASS`；CPU 模式永远不加 `runtimeClassName`。
+- `extraArgs`：可选。透传给 `llama.cpp` server 的额外参数，永远追加在最后，因此可以覆盖 operator 生成的同名参数。
 
 ## 本地快速体验
 
@@ -108,6 +123,8 @@ MODEL_CACHE_HOST_PATH=/var/lib/llmkube-models make run
 ```
 
 当该变量为空时，Pod 会继续使用默认的 `emptyDir`。
+
+`MODEL_CACHE_HOST_PATH` 应该指向一个**专用目录**（例如 `/var/lib/llmkube-models`）：controller 会先起一个 `cache-prep` initContainer，把挂载点根目录 `chown 100:101`（只改根目录，不递归）以便推理容器可写。把它指向 `/var/lib` 这类已有目录会改动宿主机上其他文件的属主。
 
 ### 4. 创建 Model
 
@@ -182,6 +199,12 @@ kubectl apply -f config/samples/llm_v1alpha1_model.yaml
 - `Ready`：当前 Deployment generation 已观测，期望副本都已经可用。
 - `Failed`：规格非法，或 Deployment 报告了失败条件。
 
+`Model.status.conditions` 里除了 `Ready`，请求 GPU 时还会有 `GPUOffload`：
+
+- `True` / `OffloadDetected`：推理日志里读到 `llama_prepare_model_devices: using device CUDA0`，message 会带上原始整行。
+- `False` / `CPUFallback`：镜像已经启动，但 llama.cpp 退回了 CPU（例如驱动或 RuntimeClass 没配好）。这是最容易踩的坑：Pod 是 Ready 的，速度却只有 CPU 水平。
+- `Unknown` / `NotDetected`：Pod 还没 Ready、日志里还没有设备行，或者日志读不到。
+
 可以通过下面命令查看更详细的 condition：
 
 ```sh
@@ -251,10 +274,10 @@ kind delete cluster --name llmops
 这个项目目前聚焦在最小可用的 GGUF 推理部署流程，还没有覆盖完整生产能力：
 
 - 暂未做多模型路由。
-- 暂未做 GPU 调度策略封装。
+- GPU 只做到「资源请求 + RuntimeClass 透传 + 日志确认」，不感知显卡型号、驱动版本，也不做多卡切分。
 - 暂未做 Pod 级别失败原因下钻。
 - 暂未提供 Helm Chart。
-- 目前默认推理后端是 `llama.cpp` server。
+- 目前默认推理后端是 `llama.cpp` server（M3 计划加入 vLLM）。
 
 ## 许可证
 

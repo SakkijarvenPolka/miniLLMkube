@@ -25,13 +25,17 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -42,8 +46,6 @@ import (
 
 const (
 	inferencePort    = 8080
-	modelPath        = "/models/model.gguf"
-	defaultImage     = "ghcr.io/ggml-org/llama.cpp:server"
 	downloaderImage  = "curlimages/curl:8.11.1"
 	defaultContext   = 4096
 	progressDeadline = 1800
@@ -70,6 +72,15 @@ type rolloutState struct {
 type ModelReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// Clientset reads inference Pod logs. The typed client is used because the
+	// controller-runtime client has no log subresource.
+	Clientset kubernetes.Interface
+	// readPodLog replaces the API server log read; it is nil in production and
+	// set by unit tests that cannot serve logs.
+	readPodLog func(ctx context.Context, pod *corev1.Pod) (string, error)
+	// gpuMu guards gpuScans, which is shared by the reconciler's workers.
+	gpuMu    sync.Mutex
+	gpuScans map[types.NamespacedName]gpuScan
 }
 
 // +kubebuilder:rbac:groups=llm.example.io,resources=models,verbs=get;list;watch;create;update;patch;delete
@@ -77,6 +88,8 @@ type ModelReconciler struct {
 // +kubebuilder:rbac:groups=llm.example.io,resources=models/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -100,7 +113,16 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, r.updateStatus(ctx, model, state, 0)
 	}
 
-	deployment, err := r.reconcileDeployment(ctx, model)
+	// Updates of the Deployment and the Service are optimistic: a concurrent
+	// writer (kubelet-driven status updates, a second controller) can bump the
+	// resource version between Get and Update, which surfaces as a 409. Retrying
+	// re-reads the object, so the second attempt sees the fresh version.
+	var deployment *appsv1.Deployment
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var reconcileErr error
+		deployment, reconcileErr = r.reconcileDeployment(ctx, model)
+		return reconcileErr
+	})
 	if err != nil {
 		log.Error(err, "Failed to reconcile Deployment", "name", model.Name)
 		statusErr := r.updateStatus(ctx, model, rolloutState{
@@ -112,7 +134,9 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, errors.Join(err, statusErr)
 	}
 
-	if err := r.reconcileService(ctx, model); err != nil {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		return r.reconcileService(ctx, model)
+	}); err != nil {
 		log.Error(err, "Failed to reconcile Service", "name", model.Name)
 		statusErr := r.updateStatus(ctx, model, rolloutState{
 			phase:   phaseFailed,
@@ -127,7 +151,10 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	state := evaluateRollout(deployment, desiredReplicas)
 	state.endpoint = endpointFor(model)
 
-	if err := r.updateStatus(ctx, model, state, deployment.Status.ReadyReplicas); err != nil {
+	// GPU offload is verified from the inference log, so it is only read once
+	// the rollout is complete; gpuConditions returns nil for CPU-only Models.
+	if err := r.updateStatus(ctx, model, state, deployment.Status.ReadyReplicas,
+		r.gpuConditions(ctx, model, state)...); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -160,66 +187,15 @@ func (r *ModelReconciler) reconcileDeployment(
 		deployment.Labels = labels
 		deployment.Spec.Replicas = pointerTo(replicasFor(model))
 		deployment.Spec.ProgressDeadlineSeconds = pointerTo(int32(progressDeadline))
+		if wantsGPU(model) {
+			deployment.Spec.Strategy = appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType}
+		} else {
+			deployment.Spec.Strategy = appsv1.DeploymentStrategy{Type: appsv1.RollingUpdateDeploymentStrategyType}
+		}
 		deployment.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
-		deployment.Spec.Template.ObjectMeta.Labels = labels
-		deployment.Spec.Template.Spec.Volumes = []corev1.Volume{modelVolume()}
-		deployment.Spec.Template.Spec.InitContainers = []corev1.Container{{
-			Name:            "model-downloader",
-			Image:           downloaderImage,
-			ImagePullPolicy: corev1.PullIfNotPresent,
-			Command:         []string{"sh", "-c"},
-			Args: []string{`set -e
-if [ -s /models/model.gguf ]; then
-  echo "model already exists, skipping download"
-  exit 0
-fi
-curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o /models/model.gguf.tmp "$MODEL_URL"
-mv /models/model.gguf.tmp /models/model.gguf`},
-			Env: []corev1.EnvVar{{
-				Name:  "MODEL_URL",
-				Value: model.Spec.Source,
-			}},
-			VolumeMounts: []corev1.VolumeMount{{
-				Name:      modelVolumeName,
-				MountPath: "/models",
-			}},
-		}}
-		deployment.Spec.Template.Spec.Containers = []corev1.Container{{
-			Name:            "llama-server",
-			Image:           imageFor(model),
-			ImagePullPolicy: corev1.PullIfNotPresent,
-			Args:            serverArgs(model),
-			Resources:       model.Spec.Resources,
-			Ports: []corev1.ContainerPort{{
-				Name:          "http",
-				ContainerPort: inferencePort,
-				Protocol:      corev1.ProtocolTCP,
-			}},
-			VolumeMounts: []corev1.VolumeMount{{
-				Name:      modelVolumeName,
-				MountPath: "/models",
-			}},
-			StartupProbe: &corev1.Probe{
-				ProbeHandler: corev1.ProbeHandler{
-					HTTPGet: &corev1.HTTPGetAction{
-						Path: "/health",
-						Port: intstr.FromString("http"),
-					},
-				},
-				PeriodSeconds:    5,
-				FailureThreshold: 120,
-			},
-			ReadinessProbe: &corev1.Probe{
-				ProbeHandler: corev1.ProbeHandler{
-					HTTPGet: &corev1.HTTPGetAction{
-						Path: "/health",
-						Port: intstr.FromString("http"),
-					},
-				},
-				TimeoutSeconds: 3,
-			},
-		}}
-
+		deployment.Spec.Template.Labels = labels
+		// Only the fields this operator owns are assigned; see applyPodSpec.
+		applyPodSpec(&deployment.Spec.Template.Spec, buildPodSpec(model))
 		return controllerutil.SetControllerReference(model, deployment, r.Scheme)
 	})
 	return deployment, err
@@ -254,6 +230,7 @@ func (r *ModelReconciler) updateStatus(
 	model *llmv1alpha1.Model,
 	state rolloutState,
 	readyReplicas int32,
+	extra ...metav1.Condition,
 ) error {
 	before := model.DeepCopy()
 	model.Status.Phase = state.phase
@@ -261,6 +238,7 @@ func (r *ModelReconciler) updateStatus(
 		model.Status.Endpoint = state.endpoint
 	}
 	model.Status.ReadyReplicas = readyReplicas
+	model.Status.CacheKey = cacheKeyFor(model.Spec.Source)
 	model.Status.ObservedGeneration = model.Generation
 	meta.SetStatusCondition(&model.Status.Conditions, metav1.Condition{
 		Type:               readyCondition,
@@ -269,6 +247,14 @@ func (r *ModelReconciler) updateStatus(
 		Reason:             state.reason,
 		Message:            state.message,
 	})
+	for _, condition := range extra {
+		meta.SetStatusCondition(&model.Status.Conditions, condition)
+	}
+	if !wantsGPU(model) {
+		// Drop a stale verdict when the GPU is no longer requested, otherwise the
+		// status keeps claiming an offload the Pod no longer performs.
+		meta.RemoveStatusCondition(&model.Status.Conditions, gpuOffloadConditionType)
+	}
 
 	if reflect.DeepEqual(before.Status, model.Status) {
 		return nil
@@ -379,13 +365,6 @@ func replicasFor(model *llmv1alpha1.Model) int32 {
 	return *model.Spec.Replicas
 }
 
-func imageFor(model *llmv1alpha1.Model) string {
-	if model.Spec.Image == "" {
-		return defaultImage
-	}
-	return model.Spec.Image
-}
-
 func contextSizeFor(model *llmv1alpha1.Model) int32 {
 	if model.Spec.ContextSize == 0 {
 		return defaultContext
@@ -393,13 +372,34 @@ func contextSizeFor(model *llmv1alpha1.Model) int32 {
 	return model.Spec.ContextSize
 }
 
+// serverArgs renders the llama-server command line. Arguments the operator
+// generates are skipped when the user already set them through spec.extraArgs,
+// and the user's arguments always come last so they win on conflicts.
 func serverArgs(model *llmv1alpha1.Model) []string {
-	return []string{
-		"--model", modelPath,
+	args := []string{
+		"--model", modelFilePathFor(model),
 		"--host", "0.0.0.0",
 		"--port", strconv.Itoa(inferencePort),
 		"--ctx-size", strconv.FormatInt(int64(contextSizeFor(model)), 10),
 	}
+	if wantsGPU(model) {
+		if !hasFlag(model.Spec.ExtraArgs, "--n-gpu-layers", "--gpu-layers", "-ngl") {
+			args = append(args, "--n-gpu-layers", strconv.Itoa(int(gpuLayersFor(model))))
+		}
+		// -lv 5 raises the log level so llama.cpp prints the device it loads
+		// the model onto; the GPUOffload condition is parsed from that line.
+		if !hasFlag(model.Spec.ExtraArgs, "--verbosity", "-v", "-lv") {
+			args = append(args, "-lv", gpuVerbosityLevel)
+		}
+	}
+	return append(args, model.Spec.ExtraArgs...)
+}
+
+// usesHostPathCache reports whether the operator was configured with a host
+// directory shared by every Pod (MODEL_CACHE_HOST_PATH). Both the volume and
+// the cache-prep init container depend on this single decision.
+func usesHostPathCache() bool {
+	return os.Getenv(modelCacheEnv) != ""
 }
 
 func modelVolume() corev1.Volume {

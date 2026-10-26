@@ -59,11 +59,45 @@ spec:
                 format: int32
                 minimum: 128
                 type: integer
-              image:
-                default: ghcr.io/ggml-org/llama.cpp:server
+              extraArgs:
                 description: |-
-                  Image is the container image for the llama.cpp inference server.
-                  When empty, defaults to "ghcr.io/ggml-org/llama.cpp:server".
+                  ExtraArgs are appended verbatim to the engine command line, after the
+                  arguments the operator generates. Use it for anything the spec does not
+                  expose; arguments the operator already set are not duplicated.
+                items:
+                  type: string
+                type: array
+              gpu:
+                description: |-
+                  GPU requests GPU acceleration for the inference server.
+                  Setting it at all (even to "{}") is what enables GPU mode: the operator
+                  then uses the CUDA image, requests nvidia.com/gpu and offloads Layers
+                  layers of the model to the GPU. Leaving it nil runs the CPU engine.
+                properties:
+                  count:
+                    default: 1
+                    description: |-
+                      Count is the number of GPUs requested as nvidia.com/gpu.
+                      Only 1 is supported today; a larger value is rejected by the CRD.
+                    format: int32
+                    maximum: 1
+                    minimum: 1
+                    type: integer
+                  layers:
+                    default: 99
+                    description: |-
+                      Layers is the number of model layers offloaded to the GPU,
+                      passed to llama.cpp as --n-gpu-layers. 99 offloads every layer of the
+                      small models this operator targets.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                type: object
+              image:
+                description: |-
+                  Image is the container image of the inference server.
+                  When empty, the operator picks the engine image from the backend
+                  (llama.cpp today) and from whether the Model asks for a GPU.
                 type: string
               replicas:
                 default: 1
@@ -133,6 +167,13 @@ spec:
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
                 type: object
+              runtimeClassName:
+                description: |-
+                  RuntimeClassName is the RuntimeClass of the inference Pod, for example
+                  "nvidia". When empty and GPU mode is enabled, the operator falls back to
+                  the GPU_RUNTIME_CLASS environment variable of its own Deployment, and then
+                  to no RuntimeClass at all (the cluster default).
+                type: string
               source:
                 description: |-
                   Source is the HTTPS download URL for GGUF model weights.
@@ -147,6 +188,11 @@ spec:
           status:
             description: status defines the observed state of Model
             properties:
+              cacheKey:
+                description: |-
+                  CacheKey 缓存目录名，等于 sha256(spec.source) 的前 12 个十六进制字符。
+                  模型文件位于缓存根目录下 <CacheKey>/ 子目录，便于到宿主机上定位文件。
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
