@@ -20,6 +20,9 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
+    - jsonPath: .status.resolvedRuntime
+      name: Runtime
+      type: string
     - jsonPath: .status.readyReplicas
       name: Ready
       type: integer
@@ -67,6 +70,16 @@ spec:
                 items:
                   type: string
                 type: array
+              format:
+                default: auto
+                description: |-
+                  Format is the weight format: "gguf" for llama.cpp, "safetensors" for vLLM.
+                  "auto" infers it from Runtime, or from Source when Runtime is "auto".
+                enum:
+                - auto
+                - gguf
+                - safetensors
+                type: string
               gpu:
                 description: |-
                   GPU requests GPU acceleration for the inference server.
@@ -167,6 +180,18 @@ spec:
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
                 type: object
+              runtime:
+                default: auto
+                description: |-
+                  Runtime selects the inference engine: "llamacpp" (GGUF weights) or "vllm"
+                  (safetensors weights from the Hugging Face Hub). "auto" leaves the choice
+                  to the operator, which infers it from Format and Source; the decision is
+                  reported in status.resolvedRuntime and never written back to the spec.
+                enum:
+                - auto
+                - llamacpp
+                - vllm
+                type: string
               runtimeClassName:
                 description: |-
                   RuntimeClassName is the RuntimeClass of the inference Pod, for example
@@ -185,6 +210,11 @@ spec:
             required:
             - source
             type: object
+            x-kubernetes-validations:
+            - message: vllm does not support gguf in this operator
+              rule: '!(self.runtime == ''vllm'' && self.format == ''gguf'')'
+            - message: llamacpp requires gguf
+              rule: '!(self.runtime == ''llamacpp'' && self.format == ''safetensors'')'
           status:
             description: status defines the observed state of Model
             properties:
@@ -266,6 +296,12 @@ spec:
                 description: ReadyReplicas 就绪副本数
                 format: int32
                 type: integer
+              resolvedFormat:
+                description: 'ResolvedFormat 实际使用的权重格式: gguf / safetensors'
+                type: string
+              resolvedRuntime:
+                description: 'ResolvedRuntime 实际使用的推理后端: llamacpp / vllm'
+                type: string
             type: object
         required:
         - spec

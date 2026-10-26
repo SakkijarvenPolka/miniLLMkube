@@ -25,6 +25,13 @@ import (
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
 // ModelSpec defines the desired state of Model
+//
+// The runtime and format combination is restricted before the object is stored:
+// vLLM cannot load GGUF weights, and llama.cpp cannot load safetensors weights.
+// Both fields default to "auto" and are validated after defaulting.
+//
+// +kubebuilder:validation:XValidation:rule="!(self.runtime == 'vllm' && self.format == 'gguf')",message="vllm does not support gguf in this operator"
+// +kubebuilder:validation:XValidation:rule="!(self.runtime == 'llamacpp' && self.format == 'safetensors')",message="llamacpp requires gguf"
 type ModelSpec struct {
 	// Source is the HTTPS download URL for GGUF model weights.
 	// The controller validates that the parsed URL uses HTTPS and that the
@@ -44,6 +51,20 @@ type ModelSpec struct {
 	// +kubebuilder:validation:Minimum=128
 	// +optional
 	ContextSize int32 `json:"contextSize,omitempty"`
+	// Runtime selects the inference engine: "llamacpp" (GGUF weights) or "vllm"
+	// (safetensors weights from the Hugging Face Hub). "auto" leaves the choice
+	// to the operator, which infers it from Format and Source; the decision is
+	// reported in status.resolvedRuntime and never written back to the spec.
+	// +kubebuilder:validation:Enum=auto;llamacpp;vllm
+	// +kubebuilder:default=auto
+	// +optional
+	Runtime string `json:"runtime,omitempty"`
+	// Format is the weight format: "gguf" for llama.cpp, "safetensors" for vLLM.
+	// "auto" infers it from Runtime, or from Source when Runtime is "auto".
+	// +kubebuilder:validation:Enum=auto;gguf;safetensors
+	// +kubebuilder:default=auto
+	// +optional
+	Format string `json:"format,omitempty"`
 	// Image is the container image of the inference server.
 	// When empty, the operator picks the engine image from the backend
 	// (llama.cpp today) and from whether the Model asks for a GPU.
@@ -104,6 +125,12 @@ type ModelStatus struct {
 	// 模型文件位于缓存根目录下 <CacheKey>/ 子目录，便于到宿主机上定位文件。
 	// +optional
 	CacheKey string `json:"cacheKey,omitempty"`
+	// ResolvedRuntime 实际使用的推理后端: llamacpp / vllm
+	// +optional
+	ResolvedRuntime string `json:"resolvedRuntime,omitempty"`
+	// ResolvedFormat 实际使用的权重格式: gguf / safetensors
+	// +optional
+	ResolvedFormat string `json:"resolvedFormat,omitempty"`
 	// ObservedGeneration 已处理的 spec 版本，用于判断 status 是否过期
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
@@ -119,6 +146,7 @@ type ModelStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=mdl
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Runtime",type=string,JSONPath=`.status.resolvedRuntime`
 // +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.readyReplicas`
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.status.endpoint`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
