@@ -383,7 +383,7 @@ var _ = Describe("Model Controller", func() {
 
 			By("touching the Model without changing anything the Deployment depends on")
 			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
-			model.Annotations = map[string]string{"f9-regression": "true"}
+			model.Annotations = map[string]string{"f9-regression": testTrueValue}
 			Expect(k8sClient.Update(ctx, model)).To(Succeed())
 
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -575,6 +575,47 @@ var _ = Describe("Model Controller", func() {
 			Expect(recorder.Events).To(Receive(ContainSubstring(reasonDownloadFailed)))
 
 			Expect(k8sClient.Delete(ctx, pod)).To(Succeed())
+		})
+
+		It("passes placement and scheduler fields through to the Pod", func() {
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			model.Spec.NodeSelector = map[string]string{testNodeArch: testArchAMD64}
+			model.Spec.Tolerations = []corev1.Toleration{{
+				Key:      gpuResourceName,
+				Operator: corev1.TolerationOpExists,
+				Effect:   corev1.TaintEffectNoSchedule,
+			}}
+			model.Spec.Affinity = &corev1.Affinity{
+				NodeAffinity: &corev1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+						NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+							MatchExpressions: []corev1.NodeSelectorRequirement{{
+								Key:      testNodeArch,
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   []string{testArchAMD64},
+							}},
+						}},
+					},
+				},
+			}
+			model.Spec.SchedulerName = testScheduler
+			Expect(k8sClient.Update(ctx, model)).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			podSpec := deployment.Spec.Template.Spec
+
+			Expect(podSpec.SchedulerName).To(Equal(testScheduler))
+			Expect(podSpec.NodeSelector).To(HaveKeyWithValue(testNodeArch, testArchAMD64))
+			Expect(podSpec.Tolerations).To(HaveLen(1))
+			Expect(podSpec.Tolerations[0].Key).To(Equal(gpuResourceName))
+			Expect(podSpec.Affinity).NotTo(BeNil())
+			Expect(podSpec.Affinity.NodeAffinity).NotTo(BeNil())
 		})
 	})
 })

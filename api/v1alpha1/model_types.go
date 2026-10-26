@@ -90,6 +90,23 @@ type ModelSpec struct {
 	// expose; arguments the operator already set are not duplicated.
 	// +optional
 	ExtraArgs []string `json:"extraArgs,omitempty"`
+	// NodeSelector is passed to the inference Pod verbatim, so a Model can be
+	// pinned to a node label without the operator knowing about the node pool.
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+	// Tolerations are passed to the inference Pod verbatim, for example to run on
+	// a node tainted for GPU workloads.
+	// +optional
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+	// Affinity is passed to the inference Pod verbatim.
+	// +optional
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+	// SchedulerName is the scheduler that places the inference Pod, for example a
+	// second scheduler or a custom plugin. When empty the operator writes
+	// "default-scheduler" explicitly, so the stored PodSpec never differs from the
+	// rendered one.
+	// +optional
+	SchedulerName string `json:"schedulerName,omitempty"`
 }
 
 // GPUSpec describes the GPU resources for one Model.

@@ -32,8 +32,11 @@ const (
 	downloaderContainerName = "model-downloader"
 	cachePrepContainerName  = "cache-prep"
 
-	defaultImage    = "ghcr.io/ggml-org/llama.cpp:server"
-	defaultGPUImage = "ghcr.io/ggml-org/llama.cpp:server-cuda"
+	defaultImage = "ghcr.io/ggml-org/llama.cpp:server"
+	// defaultSchedulerName is what the API server would default to anyway; the
+	// builder writes it so the rendered PodSpec is stable across reconciles.
+	defaultSchedulerName = "default-scheduler"
+	defaultGPUImage      = "ghcr.io/ggml-org/llama.cpp:server-cuda"
 
 	// gpuResourceName is the extended resource the device plugin advertises.
 	gpuResourceName = "nvidia.com/gpu"
@@ -69,7 +72,10 @@ func buildPodSpec(model *llmv1alpha1.Model) corev1.PodSpec {
 		InitContainers:   initContainersFor(model, backend),
 		Containers:       []corev1.Container{inferenceContainer(model, backend)},
 		RuntimeClassName: runtimeClassFor(model),
-		SchedulerName:    "default-scheduler", // M5 will pass the user value through
+		NodeSelector:     model.Spec.NodeSelector,
+		Tolerations:      model.Spec.Tolerations,
+		Affinity:         model.Spec.Affinity,
+		SchedulerName:    schedulerNameFor(model),
 	}
 	backend.PodMutations(&spec, model)
 	return spec
@@ -193,13 +199,24 @@ func applyPodSpec(dst *corev1.PodSpec, src corev1.PodSpec) {
 	dst.InitContainers = src.InitContainers
 	dst.Containers = src.Containers
 	dst.RuntimeClassName = src.RuntimeClassName // never defaulted by the API server; nil is a valid explicit value
-	dst.NodeSelector = src.NodeSelector         // M5 will pass these through from the spec
-	dst.Tolerations = src.Tolerations           // M5 will pass these through from the spec
-	dst.Affinity = src.Affinity                 // M5 will pass these through from the spec
+	dst.NodeSelector = src.NodeSelector         // a placement field: the operator never defaults it
+	dst.Tolerations = src.Tolerations           // a placement field: the operator never defaults it
+	dst.Affinity = src.Affinity                 // a placement field: the operator never defaults it
 	dst.SchedulerName = src.SchedulerName       // the builder always writes an explicit value
 	if src.EnableServiceLinks != nil {          // used by the vLLM backend in M3; nil keeps the stored value
 		dst.EnableServiceLinks = src.EnableServiceLinks
 	}
+}
+
+// schedulerNameFor returns the scheduler that must place the inference Pod. The
+// API server would default it to "default-scheduler", so the value is always
+// written explicitly: otherwise the stored template and the rendered one differ
+// on every reconcile (F9).
+func schedulerNameFor(model *llmv1alpha1.Model) string {
+	if model.Spec.SchedulerName != "" {
+		return model.Spec.SchedulerName
+	}
+	return defaultSchedulerName
 }
 
 // wantsGPU reports whether the Model asks for GPU acceleration: either through

@@ -30,6 +30,11 @@ import (
 const (
 	customImage   = "example.com/custom:1"
 	nvidiaRuntime = "nvidia"
+	// Placement values shared by the unit and envtest cases.
+	testNodeArch  = "kubernetes.io/arch"
+	testArchAMD64 = "amd64"
+	testScheduler = "custom-scheduler"
+	testTrueValue = "true"
 )
 
 func testModel(spec llmv1alpha1.ModelSpec) *llmv1alpha1.Model {
@@ -334,4 +339,70 @@ func TestHasFlag(t *testing.T) {
 	if hasFlag(nil, "--model") {
 		t.Fatalf("hasFlag matched an empty argument list")
 	}
+}
+func TestBuildPodSpecPlacement(t *testing.T) {
+	t.Run("defaults the scheduler and leaves placement empty", func(t *testing.T) {
+		spec := buildPodSpec(testModel(llmv1alpha1.ModelSpec{}))
+
+		if spec.SchedulerName != defaultSchedulerName {
+			t.Errorf("schedulerName = %q, want %q", spec.SchedulerName, defaultSchedulerName)
+		}
+		if spec.NodeSelector != nil {
+			t.Errorf("nodeSelector = %v, want nil", spec.NodeSelector)
+		}
+		if spec.Tolerations != nil {
+			t.Errorf("tolerations = %v, want nil", spec.Tolerations)
+		}
+		if spec.Affinity != nil {
+			t.Errorf("affinity = %v, want nil", spec.Affinity)
+		}
+	})
+
+	t.Run("passes every placement field through", func(t *testing.T) {
+		model := testModel(llmv1alpha1.ModelSpec{
+			NodeSelector: map[string]string{testNodeArch: testTrueValue},
+			Tolerations: []corev1.Toleration{{
+				Key:      gpuResourceName,
+				Operator: corev1.TolerationOpExists,
+				Effect:   corev1.TaintEffectNoSchedule,
+			}},
+			Affinity: &corev1.Affinity{
+				NodeAffinity: &corev1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+						NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+							MatchExpressions: []corev1.NodeSelectorRequirement{{
+								Key:      testNodeArch,
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   []string{testArchAMD64},
+							}},
+						}},
+					},
+				},
+			},
+			SchedulerName: testScheduler,
+		})
+
+		spec := buildPodSpec(model)
+
+		if spec.SchedulerName != testScheduler {
+			t.Errorf("schedulerName = %q, want custom-scheduler", spec.SchedulerName)
+		}
+		if got := spec.NodeSelector[testNodeArch]; got != testTrueValue {
+			t.Errorf("nodeSelector = %v, want the Model's map", spec.NodeSelector)
+		}
+		if len(spec.Tolerations) != 1 || spec.Tolerations[0].Key != gpuResourceName {
+			t.Errorf("tolerations = %v, want the Model's toleration", spec.Tolerations)
+		}
+		if spec.Affinity == nil || spec.Affinity.NodeAffinity == nil {
+			t.Fatalf("affinity = %v, want the Model's affinity", spec.Affinity)
+		}
+
+		t.Log("keeping placement out of the selector labels")
+
+		for key := range spec.NodeSelector {
+			if _, inLabels := labelsFor(model)[key]; inLabels {
+				t.Errorf("placement key %q leaked into the selector labels", key)
+			}
+		}
+	})
 }
