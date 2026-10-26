@@ -28,6 +28,10 @@ const (
 	testModelSource   = "https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q4_K_M.gguf"
 	testModelFileName = "Qwen3-0.6B-Q4_K_M.gguf"
 	testNamespace     = "default"
+	// testUnitModelName and testDownloadMessage are shared by the unit tests
+	// that build Models and Pods by hand.
+	testUnitModelName   = "qwen"
+	testDownloadMessage = "GET returned 404"
 )
 
 func TestCacheKeyFor(t *testing.T) {
@@ -122,7 +126,7 @@ func TestModelFileName(t *testing.T) {
 
 func TestModelPaths(t *testing.T) {
 	model := &llmv1alpha1.Model{
-		ObjectMeta: metav1.ObjectMeta{Name: "qwen", Namespace: testNamespace},
+		ObjectMeta: metav1.ObjectMeta{Name: testUnitModelName, Namespace: testNamespace},
 		Spec:       llmv1alpha1.ModelSpec{Source: testModelSource},
 	}
 
