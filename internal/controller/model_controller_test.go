@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -521,6 +522,59 @@ var _ = Describe("Model Controller", func() {
 			Expect(downloader.Image).To(Equal(vllmImage))
 			Expect(downloader.Args[0]).To(Equal(downloadScriptSafetensors))
 			Expect(downloader.Env).To(ContainElement(corev1.EnvVar{Name: "MODEL_REPO", Value: "Qwen/Qwen3-0.6B"}))
+		})
+
+		It("reports the Pod failure that keeps the rollout incomplete", func() {
+			recorder := events.NewFakeRecorder(16)
+			controllerReconciler.Recorder = recorder
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("creating the Pod the kubelet would report after a failed download")
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName + "-diagnosed",
+					Namespace: testNamespace,
+					Labels:    labelsFor(model),
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{
+					Name:  inferenceContainerName,
+					Image: modelImage,
+				}}},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			pod.Status.Phase = corev1.PodPending
+			pod.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+				Name: downloaderContainerName,
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 22,
+					Message:  "GET returned 404 Not Found",
+				}},
+			}}
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+			By("reconciling again now that the Pod explains the stall")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal(phaseFailed))
+
+			ready := meta.FindStatusCondition(model.Status.Conditions, readyCondition)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(reasonDownloadFailed))
+			Expect(ready.Message).To(ContainSubstring("404"))
+
+			By("emitting a warning for the transition")
+			Expect(recorder.Events).To(Receive(ContainSubstring(reasonDownloadFailed)))
+
+			Expect(k8sClient.Delete(ctx, pod)).To(Succeed())
 		})
 	})
 })

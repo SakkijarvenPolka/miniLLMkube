@@ -37,7 +37,7 @@ func testModel(spec llmv1alpha1.ModelSpec) *llmv1alpha1.Model {
 		spec.Source = testModelSource
 	}
 	return &llmv1alpha1.Model{
-		ObjectMeta: metav1.ObjectMeta{Name: "qwen", Namespace: testNamespace},
+		ObjectMeta: metav1.ObjectMeta{Name: testUnitModelName, Namespace: testNamespace},
 		Spec:       spec,
 	}
 }

@@ -32,11 +32,16 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	llmv1alpha1 "github.com/SakkijarvenPolka/minillmkube/api/v1alpha1"
 )
@@ -50,6 +55,11 @@ const (
 	modelCacheEnv    = "MODEL_CACHE_HOST_PATH"
 	modelVolumeName  = "model"
 	inferenceAppName = "minillmkube-inference"
+
+	inferenceInstanceLabel  = "app.kubernetes.io/instance"
+	inferenceNameLabel      = "app.kubernetes.io/name"
+	inferenceManagedByLabel = "app.kubernetes.io/managed-by"
+	inferenceManagedBy      = "minillmkube"
 
 	phasePending   = "Pending"
 	phaseDeploying = "Deploying"
@@ -72,6 +82,9 @@ type ModelReconciler struct {
 	// Clientset reads inference Pod logs. The typed client is used because the
 	// controller-runtime client has no log subresource.
 	Clientset kubernetes.Interface
+	// Recorder publishes the failure transitions of a Model; it is nil in tests
+	// that do not care about events.
+	Recorder events.EventRecorder
 	// readPodLog replaces the API server log read; it is nil in production and
 	// set by unit tests that cannot serve logs.
 	readPodLog func(ctx context.Context, pod *corev1.Pod) (string, error)
@@ -87,6 +100,7 @@ type ModelReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -147,6 +161,11 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	desiredReplicas := replicasFor(model)
 	state := evaluateRollout(deployment, desiredReplicas)
 	state.endpoint = endpointFor(model)
+	// A Pod that cannot start never becomes ready, so the Deployment keeps
+	// reporting progress forever; the Pod status holds the actual reason.
+	state = r.withPodDiagnosis(ctx, model, state)
+
+	previousReason := readyConditionReason(model)
 
 	// GPU offload is verified from the inference log, so it is only read once
 	// the rollout is complete; gpuConditions returns nil for CPU-only Models.
@@ -154,8 +173,67 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		r.gpuConditions(ctx, model, state)...); err != nil {
 		return ctrl.Result{}, err
 	}
+	r.recordFailureEvent(ctx, model, state, previousReason)
 
 	return ctrl.Result{}, nil
+}
+
+// withPodDiagnosis replaces the generic rollout state with the Pod-level failure
+// diagnosis when there is one. It is best effort: a List error leaves the
+// Deployment-derived state untouched instead of failing the reconcile.
+func (r *ModelReconciler) withPodDiagnosis(
+	ctx context.Context,
+	model *llmv1alpha1.Model,
+	state rolloutState,
+) rolloutState {
+	if state.phase == phaseReady {
+		return state
+	}
+
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods,
+		client.InNamespace(model.Namespace),
+		client.MatchingLabels(labelsFor(model)),
+	); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to list inference Pods for diagnosis",
+			"name", model.Name)
+		return state
+	}
+
+	diagnosis := diagnosePods(pods.Items)
+	if diagnosis == nil {
+		return state
+	}
+
+	state.phase = phaseFailed
+	state.status = metav1.ConditionFalse
+	state.reason = diagnosis.reason
+	state.message = diagnosis.message
+	return state
+}
+
+// readyConditionReason returns the Reason currently stored on the Ready
+// condition, or "" when the Model has none yet.
+func readyConditionReason(model *llmv1alpha1.Model) string {
+	if condition := meta.FindStatusCondition(model.Status.Conditions, readyCondition); condition != nil {
+		return condition.Reason
+	}
+	return ""
+}
+
+// recordFailureEvent emits one Warning per failure transition. Emitting on every
+// reconcile would flood a persistently failing Model with events (E30).
+func (r *ModelReconciler) recordFailureEvent(
+	ctx context.Context,
+	model *llmv1alpha1.Model,
+	state rolloutState,
+	previousReason string,
+) {
+	if r.Recorder == nil || state.phase != phaseFailed || state.reason == previousReason {
+		return
+	}
+	r.Recorder.Eventf(model, nil, corev1.EventTypeWarning, state.reason, "ReconcileModel", "%s", state.message)
+	logf.FromContext(ctx).Info("Recorded failure event", "name", model.Name, "reason", state.reason)
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -164,8 +242,34 @@ func (r *ModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&llmv1alpha1.Model{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
+		// A failing Pod does not change the Deployment status, so its Model must
+		// be reconciled again when the Pod reports a new failure reason.
+		Watches(&corev1.Pod{},
+			handler.EnqueueRequestsFromMapFunc(r.podToModelRequest),
+			builder.WithPredicates(predicate.NewPredicateFuncs(isInferencePod))).
 		Named("model").
 		Complete(r)
+}
+
+// podToModelRequest maps an inference Pod back to the Model that owns it. The
+// label is the only link available: the Pod is owned by the ReplicaSet, not by
+// the Model.
+func (r *ModelReconciler) podToModelRequest(_ context.Context, object client.Object) []reconcile.Request {
+	name := object.GetLabels()[inferenceInstanceLabel]
+	if name == "" {
+		return nil
+	}
+	return []reconcile.Request{{
+		NamespacedName: types.NamespacedName{Namespace: object.GetNamespace(), Name: name},
+	}}
+}
+
+// isInferencePod filters out every Pod this controller does not own.
+func isInferencePod(object client.Object) bool {
+	labels := object.GetLabels()
+	return labels[inferenceInstanceLabel] != "" &&
+		labels[inferenceNameLabel] == inferenceAppName &&
+		labels[inferenceManagedByLabel] == inferenceManagedBy
 }
 
 func (r *ModelReconciler) reconcileDeployment(
@@ -335,9 +439,9 @@ func endpointFor(model *llmv1alpha1.Model) string {
 
 func labelsFor(model *llmv1alpha1.Model) map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/name":       inferenceAppName,
-		"app.kubernetes.io/instance":   model.Name,
-		"app.kubernetes.io/managed-by": "minillmkube",
+		inferenceNameLabel:      inferenceAppName,
+		inferenceInstanceLabel:  model.Name,
+		inferenceManagedByLabel: inferenceManagedBy,
 	}
 }
 
