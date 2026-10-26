@@ -23,13 +23,13 @@ miniLLMkube 把这些动作收进一个自定义资源里。用户只关心模�
 - 使用 `Model` CRD 声明一个推理服务，支持 `llama.cpp`（GGUF）和 vLLM（safetensors）两种后端。
 - `spec.runtime` / `spec.format` 默认 `auto`：能从 `source` 推断的就不用手写，解析结果写进 `status.resolvedRuntime` / `status.resolvedFormat`；`vllm + gguf`、`llamacpp + safetensors` 这类组合会被 CEL 直接拒绝。
 - 校验 `spec.source`：GGUF 必须是主机名非空的 HTTPS URL 且路径以 `.gguf` 结尾；vLLM 用 `hf://<org>/<repo>[@<revision>]`。
-- 通过 initContainer 下载模型：GGUF 使用 `curlimages/curl:8.11.1`，safetensors 使用固定 vLLM 镜像内的 Hugging Face CLI（镜像实际工具可用性待 T0 核验）。
+- 通过 initContainer 下载模型：GGUF 使用 `curlimages/curl:8.11.1`；safetensors 复用固定 vLLM 镜像内的 Hugging Face CLI（CLI 名称与可用性尚未在真实集群核验，见 `docs/ROADMAP.md` 的 M3-T0）。
 - 每个 `source` 有自己的缓存目录 `/models/<cacheKey>/`（GGUF 文件位于该目录内）：`cacheKey` 取 `source` 的 sha256 前 12 位，换模型不会互相覆盖，`status.cacheKey` 会把它暴露出来。
 - 下载时先写 `<文件名>.tmp`，校验通过后再改名，避免半成品模型被主容器读取。
 - 同一缓存目录用 `flock` 串行化：多个副本同时启动时只有一个 Pod 真正下载，其余 Pod 等锁后直接命中。
 - 支持断点续传：已有 `.tmp` 时先 `HEAD` 比对 `Content-Length`，再 `curl -C -` 续传；`EXPECT_FORMAT=gguf` 时会校验 `GGUF` 魔数。
 - 主容器运行 `llama.cpp` server 或 vLLM，并提供 OpenAI 兼容 API；vLLM 会自动给 `/dev/shm` 挂内存卷、关掉 service link 注入（vLLM 会校验未知的 `VLLM_*` 变量）。
-- vLLM 下载器仅在完整下载成功并通过配置、权重及分片、tokenizer 检查后写入 `.complete` 完成标记。缓存命中必须有该标记，并重新检查配置、索引引用的全部分片和至少一种非空 tokenizer 文件；缺标记的目录会重新下载，不能只凭 `config.json` 和单个权重文件判定完成。格式不符报 `FORMAT_MISMATCH`。
+- vLLM 下载器只有在完整下载成功、并通过配置、权重分片和 tokenizer 检查后，才写入 `.complete` 完成标记。缓存命中必须带该标记，并重新检查配置、索引引用的全部分片和至少一种非空 tokenizer 文件；缺标记的目录会重新下载，不会只凭 `config.json` 和单个权重文件就判定完成。格式不符报 `FORMAT_MISMATCH`。
 - 支持 GPU 资源声明：`spec.gpu` 会请求 `nvidia.com/gpu`；llama.cpp 默认改用 CUDA 镜像、追加 `--n-gpu-layers`，并从推理日志里确认 GPU 是否真的生效。vLLM 必须声明有效 GPU 资源，实际推理可用性待集群验证。
 - 创建 ClusterIP Service，集群内访问地址会写入 `status.endpoint`。
 - 根据 Deployment 状态维护 `Pending`、`Deploying`、`Ready`、`Failed` 阶段。
@@ -42,17 +42,49 @@ miniLLMkube 把这些动作收进一个自定义资源里。用户只关心模�
 Model YAML
    |
    v
-Model Controller
+Model Controller（resolveBackend 决定 llama.cpp 或 vLLM）
    |
    +--> Deployment
    |      |
-   |      +--> initContainer: 下载 GGUF 到 /models/<cacheKey>/<文件名>
-   |      +--> llama.cpp server: 加载同一路径
+   |      +--> initContainer: 下载模型到 /models/<cacheKey>/
+   |      |      GGUF        -> <文件名>
+   |      |      safetensors -> 仓库快照目录
+   |      |
+   |      +--> 推理容器
+   |             llama.cpp server：加载 /models/<cacheKey>/<文件名>
+   |             vLLM：加载 /models/<cacheKey>/<repo>，另挂 /dev/shm 内存卷
    |
    +--> Service: 暴露 8080 端口
    |
-   +--> Model Status: phase / endpoint / readyReplicas / resolvedRuntime / conditions
+   +--> Model Status: phase / endpoint / readyReplicas / resolvedRuntime / resolvedFormat / conditions
 ```
+
+## 资源与镜像体积
+
+两种后端的镜像体积差一个数量级，第一次拉取前先确认磁盘和带宽：
+
+| 后端 | 默认镜像 | Registry 压缩大小（amd64） | 落盘估算 |
+|---|---|---|---|
+| llama.cpp CPU | `ghcr.io/ggml-org/llama.cpp:server` | 0.31 GB | 约 1 GB |
+| llama.cpp GPU | `ghcr.io/ggml-org/llama.cpp:server-cuda` | 2.60 GB | 约 5–6 GB |
+| vLLM | `vllm/vllm-openai:v0.32.0-cu129` | 11.18 GB | 约 20–25 GB |
+
+vLLM 体积大，是因为镜像里打进了整套运行时：CUDA runtime（cu129）、PyTorch 自带的另一份 CUDA 库，以及 vLLM 自己编译的 FlashAttention、paged-attention 和量化 kernel。llama.cpp 镜像里只有一个静态编译的二进制和最小运行库，所以小一个数量级。
+
+压缩大小取自镜像仓库的 manifest；落盘大小是解包后的估算（CUDA 类镜像通常膨胀到 2 倍左右）。按 vLLM 规划节点时至少预留：
+
+- 镜像解包：约 25 GB
+- 模型权重：按仓库大小，`Qwen3-0.6B` 约 1.5 GB
+- `/dev/shm`：vLLM 会挂内存卷，上限取推理容器内存 limit 的一半
+- 建议合计预留 **40 GB 以上**
+
+拉取耗时由带宽决定：11.18 GB 在 20 MB/s 下约 10 分钟，5 MB/s 下约 37 分钟。先确认空间：
+
+```sh
+df -h /var/lib/rancher   # k3s 的 containerd 镜像默认落在这里
+```
+
+如果只是评估 vLLM 可行性，可以先拉镜像起一个手动 Pod，确认能启动、记录冷启动时间，再决定是否切后端；不要直接改生产 Model。
 
 ## Model 示例
 
@@ -292,6 +324,8 @@ kind delete cluster --name llmops
 ```
 
 ## 当前边界
+
+M1～M5 的代码已完成（当前在 `feat/m3-m4` 分支，尚未合入 `main`），本地 `make test` / `make lint` 通过；但所有里程碑的**集群验收步骤都还没执行**，本地测试通过不等于真实集群可用。
 
 这个项目目前聚焦在最小可用的推理部署流程，还没有覆盖完整生产能力：
 
