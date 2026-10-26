@@ -107,6 +107,8 @@ spec:
 - `gpu`：可选。写 `gpu: {}` 即请求一张 GPU（`count` 默认 1、上限 1），`layers` 默认 99，会翻译成 `--n-gpu-layers 99`；不想让 Cluster 里的 GPU 设备插件介入时就不写这一节。
 - `runtimeClassName`：可选。GPU 场景一般填 `nvidia`。留空时，只有在请求 GPU 的情况下才会回落到 controller 的环境变量 `GPU_RUNTIME_CLASS`；CPU 模式永远不加 `runtimeClassName`。
 - `extraArgs`：可选。透传给推理进程的额外参数，永远追加在最后；operator 生成参数前会检查同名 flag（`--x` 与 `--x=v` 都认），用户写过的就不再追加。
+- `nodeSelector` / `tolerations` / `affinity`：可选。原样写进 Pod 模板，用来把推理 Pod 钉到特定节点（GPU 型号、专用节点池、污点容忍）。
+- `schedulerName`：可选。留给外部调度器（比如自研 GPU 调度插件）；留空时仍用集群默认的 `default-scheduler`。
 
 ## 本地快速体验
 
@@ -296,6 +298,7 @@ kind delete cluster --name llmops
 - 暂未做多模型路由。
 - GPU 只做到「资源请求 + RuntimeClass 透传 + 日志确认」，不感知显卡型号、驱动版本，也不做多卡切分；GPU 副本目前按 `Recreate` 更新，避免旧 Pod 占着显卡不放。
 - vLLM 后端只在一个 12GB 单卡环境上试过参数，`--gpu-memory-utilization` 固定 0.85，没有做显存自适应；WSL2 下需要 operator 环境变量 `ENABLE_WSL2_VLLM_PIN_MEMORY=true` 才会注入 `VLLM_WSL2_ENABLE_PIN_MEMORY=1`。
+- 放置字段（`nodeSelector` / `tolerations` / `affinity` / `schedulerName`）只透传不校验：填错 `nodeSelector` 会表现成 `Unschedulable`，不会在 admission 阶段被拒绝。
 - 暂未提供 Helm Chart。
 
 ## 许可证

@@ -597,7 +597,7 @@ SchedulerName string              `json:"schedulerName,omitempty"`
 | M3-T4 vLLM 后端 | 已完成 | feat/m3-m4 94453fe | 参数/Env/PodMutations/下载脚本；`/dev/shm` 内存卷与 `enableServiceLinks=false` |
 | M4-T1 诊断纯函数 | 已完成 | feat/m3-m4 f84b17a | `diagnose.go` 六级优先级 + 512 字节截断；单测覆盖每级与优先级 |
 | M4-T2 接入 Reconcile | 已完成 | feat/m3-m4 1c16129 | Pod 诊断覆盖状态、Pod watch、Reason 变化发 Warning；envtest 覆盖诊断与事件 |
-| M5 透传字段 | 未开始 | | |
+| M5 透传字段 | 已完成 | feat/m3-m4 e6ee5bd | `SchedulerName` 留空仍写 `default-scheduler`（F9）；放置字段不进 selector（E28）；外部调度器验收留待上集群 |
 
 M1、M2、M3、M4 的「集群验收」步骤均未执行（用户要求暂不上集群），只完成到 `make test` / `make lint` 全绿。验收前需要按各任务节点核对一遍真实集群行为；M3-T0 的 vLLM 可行性探查也因无集群未做。
 
