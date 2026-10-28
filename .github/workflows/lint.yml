@@ -18,10 +18,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # go.mod 里的 go 指令只是最低版本要求（1.25.7），而自定义 golangci-lint
+      # v2.15.0 要求 go >= 1.26：按 go.mod 安装 1.25.7 会让 go install 直接失败。
+      # 这里给 lint 任务固定较新的 Go，保证自定义 linter 能编译。
       - name: Setup Go
         uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
-          go-version-file: go.mod
+          go-version: '1.27.x'
 
       - name: Check linter configuration
         run: make lint-config
