@@ -86,7 +86,7 @@ kubectl get pods -A -o wide | grep -i gpu-operator
 
 **下载很慢或反复重试**
 
-下载器有 5 次重试、低速阈值 1024 B/s × 120 秒。慢网络下先确认 `curl -I <source>` 能通；已有 `.tmp` 时会续传，不会从头再来。想看进度：
+下载器最多重试 30 次，单次传输低于 1024 B/s 持续 120 秒即判定停滞并重新续传；已有 `.tmp` 时会从断点继续，不会从头再来。慢网络下先确认 `curl -r 0-0 -I <source>` 能通且支持 Range。想看进度：
 
 ```sh
 kubectl logs <pod> -c model-downloader -f

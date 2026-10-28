@@ -19,6 +19,7 @@ miniLLMkube 支持两种推理后端。`spec.runtime` 默认 `auto`：GGUF 地�
 - 启动参数：`--model <文件> --host :: --port 8080 --ctx-size <contextSize> --alias <Model 名>`。
 - 请求 GPU 时追加 `--n-gpu-layers <layers>`（默认 99）和 `-lv 5`；后者是为了让 llama.cpp 打印实际加载设备，`GPUOffload` 条件从这行日志解析。
 - 启动探针按 120 次 × 5 秒（10 分钟）估算，给加载模型和创建 CUDA 上下文留时间。
+- 已在单节点 K3s + RTX 5070 Ti Laptop（12 GB）上验证：Qwen3.5-2B Q8_0（1.9 GB）、32K 上下文、`--n-gpu-layers 99`，生成速度约 150 tok/s，`GPUOffload` 报 `OffloadDetected`。
 
 ## vLLM
 

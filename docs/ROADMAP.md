@@ -1,6 +1,6 @@
 # miniLLMkube 开发计划（v3，agent 可执行版）：GPU 推理 + vLLM/llama.cpp 双引擎
 
-> 状态：代码实现与审查修复进行中；原始计划基线为 `cd79cde`（2026-10-25），当前进度以第 6 章为准。M3-T0 与各里程碑集群验收尚未执行，不据本地测试宣称 vLLM 已可用。
+> 状态：代码实现与审查修复完成；原始计划基线为 `cd79cde`（2026-10-25），当前进度以第 6 章为准。llama.cpp 侧已通过单节点集群验证（2026-10-28），M3-T0 与 vLLM 侧集群验收尚未执行，不据本地测试宣称 vLLM 已可用。
 > 读者：负责执行开发的 agent。按任务编号推进，一个任务一个提交，完成后更新第 6 章。
 > 本版已把上一版所有「实现时再确认」的事项实测落定（第 2 章 F1~F14，全部带证据）；除第 9 章列出的少数优化项外，任务里的代码与命令可以直接照写执行。
 > 第 7~9 章沿用上一版并小幅修订（E20），各任务按编号引用。
@@ -399,7 +399,8 @@ var gpuDeviceRe = regexp.MustCompile(`llama_prepare_model_devices: using device 
 func parseGPUDevice(logText string) (string, bool)
 
 // scanGPUOffload 在 rollout Ready 后调用一次：List 属于该 Model 的 Pod，取第一个
-// Running 的推理 Pod，读取日志（PodLogOptions{TailLines: 1000, LimitBytes: 512KiB}，E34），
+// Running 的推理 Pod，读取日志（PodLogOptions{SinceTime: pod.CreationTimestamp, LimitBytes: 512KiB}；
+// 不用 TailLines：`-lv 5` 启动日志超过 tail 窗口，设备行会被截掉，见 6.2），
 // 交给 parseGPUDevice。日志读失败返回 error，不猜测。
 func (r *ModelReconciler) scanGPUOffload(ctx context.Context, m *llmv1alpha1.Model) (string, bool, error)
 ```
@@ -599,7 +600,9 @@ SchedulerName string              `json:"schedulerName,omitempty"`
 | M4-T2 接入 Reconcile | 已完成 | feat/m3-m4 1c16129 | Pod 诊断覆盖状态、Pod watch、Reason 变化发 Warning；envtest 覆盖诊断与事件 |
 | M5 透传字段 | 已完成 | feat/m3-m4 e6ee5bd | `SchedulerName` 留空仍写 `default-scheduler`（F9）；放置字段不进 selector（E28）；外部调度器验收留待上集群 |
 
-M1、M2、M3、M4 的「集群验收」步骤均未执行（用户要求暂不上集群）。此前实现轮次记录 `make test` / `make lint` 全绿；此记录不替代本轮修复后的测试，也不代表集群验收。本轮只做本地验证、不跑 make、不访问集群、不提交。M3-T0 手动 Pod 探查仍待用户授权集群验证，M3-T4 当前仅为代码完成，CLI/镜像工具、Blackwell 内核、WSL2 pin-memory、冷启动阈值均未在目标集群验证。
+**2026-10-28 更新**：llama.cpp 侧已在单节点 K3s（RTX 5070 Ti Laptop 12 GB）完成实际验证：下载 → 缓存命中 → GPU 推理（`GPUOffload=True/OffloadDetected`）→ Service 集群内访问，Qwen3.5-2B Q8_0、32K 上下文、约 150 tok/s。验证中发现并修复两个缺陷（大文件无法续传、GPU 日志 tail 窗口漏掉设备行），见下方 6.2。**vLLM 侧的集群验收仍未执行。**
+
+其余「集群验收」步骤（M1/M2 的完整清单、M3-T0、M5 外部调度器）仍未执行。此前实现轮次记录 `make test` / `make lint` 全绿；此记录不替代本轮修复后的测试，也不代表集群验收。本轮只做本地验证、不跑 make、不访问集群、不提交。M3-T0 手动 Pod 探查仍待用户授权集群验证，M3-T4 当前仅为代码完成，CLI/镜像工具、Blackwell 内核、WSL2 pin-memory、冷启动阈值均未在目标集群验证。
 
 ### 6.1 本轮审查修复（2026-10-26，提交 062263d）
 
@@ -607,6 +610,13 @@ M1、M2、M3、M4 的「集群验收」步骤均未执行（用户要求暂不�
 - 下载缓存增加 `.complete` 完成标记，并核验配置、索引全部分片和 tokenizer；未完整成功的目录不能当作缓存命中。source 缓存键不自动追踪可变上游，HF 应固定不可变 commit revision，GGUF 应使用不可变 URL。
 - README 明确非 llama.cpp 的 `GPUOffload=Unknown/NotDetected`、显式 RuntimeClass 在 CPU 模式也透传、llama.cpp 目前仅 GPU/日志 flag 去重，未宣称基础 flag 全部去重。
 - 其余 Reconcile、诊断与 GPU 观测修复以本轮代码和测试为准，已提交为 `062263d`。T0 与全部真实集群行为等待后续授权验证。
+
+### 6.2 集群验证修复（2026-10-28）
+
+llama.cpp 侧集群验证发现两个缺陷，已修复：
+
+- **大文件下载无法续传**：原脚本靠 `curl --retry`，失败后 `-C -` 的偏移被重试截断，导致每次都从头下载；总长又依赖 `HEAD` 的 `Content-Length`。改为脚本外层重试（最多 30 次）、用 `curl -r 0-0` 的 `Content-Range` 取总长、退出码 33 时删掉 `.tmp` 重来，403/416 视为远端已完成。实测 Qwen3.5-2B Q8_0（1.9 GB）在 1.3 GB 处反复停滞，修复后可从断点继续。
+- **`GPUOffload` 恒为 `NotDetected`**：`-lv 5` 的启动日志有 6000 余行，设备行出现在第 76 行，`TailLines=1000` 的窗口取不到。改为从 `pod.CreationTimestamp` 起读（`SinceTime`），保留 `LimitBytes` 防止单行过大。
 
 ## 7. 边界问题清单
 

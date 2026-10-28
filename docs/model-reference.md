@@ -71,7 +71,7 @@ spec:
 - GGUF 落在目录内的文件名取自 URL basename；不符合 `^[A-Za-z0-9._-]{1,200}$` 时回落到 `model.gguf`。
 - 下载先写 `<文件名>.tmp`，校验通过才改成最终名，避免主容器读到半成品。
 - 同一目录用 `flock` 串行化：多个副本同时启动时只有一个真正下载，其余等锁后直接命中。
-- 断点续传：已有 `.tmp` 时先 `HEAD` 比对 `Content-Length`，不符就删掉重来，然后 `curl -C -` 续传；`EXPECT_FORMAT=gguf` 时校验 `GGUF` 魔数，不符报 `FORMAT_MISMATCH`。
+- 断点续传：先用 `curl -r 0-0` 的 `Content-Range` 读出总长；已有 `.tmp` 时从当前大小继续，总长不一致或服务端返回 416 才删掉重来。中断由脚本外层重试处理（最多 30 次，单次 2 分钟无进展即判定停滞），本地文件始终保留，不会每次从头下载；`EXPECT_FORMAT=gguf` 时校验 `GGUF` 魔数，不符报 `FORMAT_MISMATCH`。
 - safetensors 侧只有在完整下载并通过配置、权重分片和 tokenizer 检查后才写 `.complete` 完成标记；缓存命中必须带该标记，且会重新检查 `config.json`、索引引用的全部分片和至少一种非空 tokenizer 文件。
 
 ## 状态字段

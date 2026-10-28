@@ -51,7 +51,7 @@ Model Controller（resolveBackend 决定 llama.cpp 或 vLLM）
 | 默认镜像 | `ghcr.io/ggml-org/llama.cpp:server` / `:server-cuda` | `vllm/vllm-openai:v0.32.0-cu129` |
 | 镜像压缩体积 | 0.31 GB / 2.60 GB | 11.18 GB |
 | 适合 | 单机小模型、CPU 也能跑、启动快 | 大模型、高吞吐、continuous batching |
-| 状态 | 已实现 | 代码完成，集群验收未执行 |
+| 状态 | 已在单节点集群上跑通 | 代码完成，集群验收未执行 |
 
 参数、资源预留和 vLLM 的 `/dev/shm`、环境变量等细节见 [docs/backends.md](docs/backends.md)。
 
@@ -115,7 +115,7 @@ kubectl apply -f config/samples/llm_v1alpha1_model.yaml
 
 ## 当前边界
 
-M1～M5 的代码已完成（当前在 `feat/m3-m4` 分支，尚未合入 `main`），本地 `make test` / `make lint` 通过；但所有里程碑的**集群验收步骤都还没执行**，本地测试通过不等于真实集群可用。
+M1～M5 的代码已完成（当前在 `feat/m3-m4` 分支，尚未合入 `main`），本地 `make test` / `make lint` 通过。llama.cpp 侧已在单节点 K3s（RTX 5070 Ti Laptop，12 GB 显存）上跑通完整链路：权重下载与缓存命中 → GPU 推理 → Service 访问 → `GPUOffload=True`；**vLLM 侧的集群验收仍未执行**。
 
 - 暂未做多模型路由，暂未提供 Helm Chart。
 - GPU 只做到「资源请求 + RuntimeClass 透传 + 日志确认」，不感知显卡型号和驱动版本，不做多卡切分；GPU 副本按 `Recreate` 更新，避免旧 Pod 占着显卡不放。
