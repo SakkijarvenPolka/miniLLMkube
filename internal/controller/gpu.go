@@ -7,6 +7,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -22,7 +23,6 @@ const (
 	// Requesting a GPU is a request; this condition is the observation.
 	gpuOffloadConditionType = "GPUOffload"
 
-	gpuLogTailLines  = int64(1000)
 	gpuLogLimitBytes = int64(512 * 1024)
 
 	gpuDeviceCUDA = "CUDA"
@@ -128,25 +128,27 @@ func (r *ModelReconciler) runningInferencePod(
 	return nil, nil
 }
 
-// inferencePodLog reads the tail of the inference container log.
+// inferencePodLog reads the inference container log from the start of the Pod.
 //
-// The read is bounded twice: TailLines keeps a long-running server from
-// streaming its whole history, LimitBytes caps the bytes the API server sends.
-// The device line is printed at startup, so the tail is only a concern for a Pod
-// that has been serving for a very long time -- that case is covered by caching
-// the observation per Pod instead of re-reading.
+// The device line is printed while the model loads, at the very beginning of
+// the log, so a tail window would drift past it as soon as a busy server logs
+// more than the window. Reading from the start with a byte cap keeps the read
+// bounded while still covering the startup lines.
 func (r *ModelReconciler) inferencePodLog(ctx context.Context, pod *corev1.Pod) (string, error) {
 	if r.Clientset == nil {
 		return "", errors.New("pod log client is not configured")
 	}
 
-	tailLines := gpuLogTailLines
 	limitBytes := gpuLogLimitBytes
-	stream, err := r.Clientset.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+	opts := &corev1.PodLogOptions{
 		Container:  inferenceContainerName,
-		TailLines:  &tailLines,
 		LimitBytes: &limitBytes,
-	}).Stream(ctx)
+	}
+	if !pod.CreationTimestamp.IsZero() {
+		sinceSeconds := max(0, int64(time.Since(pod.CreationTimestamp.Time).Seconds()))
+		opts.SinceSeconds = &sinceSeconds
+	}
+	stream, err := r.Clientset.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, opts).Stream(ctx)
 	if err != nil {
 		return "", fmt.Errorf("open log stream for pod %s: %w", pod.Name, err)
 	}
