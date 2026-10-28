@@ -57,7 +57,7 @@ spec:
 - `format`：`auto`（默认）、`gguf`、`safetensors`。`vllm + gguf`、`llamacpp + safetensors` 会被 CEL 直接拒绝。
 - `replicas`：推理 Pod 数量，可以设为 `0` 表示缩容到零。
 - `contextSize`：上下文窗口大小（token），翻译成 llama.cpp 的 `--ctx-size` 或 vLLM 的 `--max-model-len`。
-- `image`：可选。留空时按后端和是否请求 GPU 选默认镜像：llama.cpp GPU 用 `server-cuda`、CPU 用 `server`；vLLM 固定 `vllm/vllm-openai:v0.32.0-cu129`。
+- `image`：可选。留空时按后端和是否请求 GPU 选默认镜像：llama.cpp GPU 用 `server-cuda`、CPU 用 `server`；vLLM 固定 `vllm/vllm-openai:v0.32.0`。
 - `resources`：推理容器的 CPU/内存请求和限制。建议显式配置，避免模型进程被 OOM Kill；vLLM 还会用内存 limit 的一半作为 `/dev/shm` 大小。
 - `gpu`：llama.cpp 可选、vLLM 必须。写 `gpu: {}` 即请求一张 GPU（`count` 默认 1、上限 1）；`layers` 默认 99。在 `resources.limits` 里显式写 `nvidia.com/gpu` 优先，不会被 `gpu` 覆盖；零值、负值和小数不满足 vLLM 的要求。
 - `runtimeClassName`：可选。显式值始终透传（CPU 模式也一样）；未设置时，只有请求 GPU 才回落到 controller 环境变量 `GPU_RUNTIME_CLASS`。

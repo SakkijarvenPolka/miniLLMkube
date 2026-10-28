@@ -23,7 +23,9 @@ miniLLMkube 支持两种推理后端。`spec.runtime` 默认 `auto`：GGUF 地�
 
 ## vLLM
 
-- 默认镜像：`vllm/vllm-openai:v0.32.0-cu129`（固定 tag，nightly 需要更新的驱动）。
+- 默认镜像：`vllm/vllm-openai:v0.32.0`（固定 tag）。该 tag 是 CUDA 13 构建，需要 580 以上驱动；
+  不要用 `-cu129` 变体——它打包的 torchcodec 是按 CUDA 13 编译的，容器启动即报
+  `libnvrtc.so.13: cannot open shared object file`（[vllm#60406](https://github.com/vllm-project/vllm/issues/60406)）。
 - 必须请求 GPU：写 `gpu: {}` 或在 `resources.limits` 里给有效的 `nvidia.com/gpu`。
 - 启动参数：`--model <目录> --served-model-name <Model 名> --host :: --port 8080 --max-model-len <contextSize> --gpu-memory-utilization 0.85`。
 - 下载器复用同一个镜像里的 Hugging Face CLI，按 `hf://<org>/<repo>[@<revision>]` 取模型；设置 operator 环境变量 `HF_ENDPOINT` 可走镜像站。
@@ -37,9 +39,9 @@ miniLLMkube 支持两种推理后端。`spec.runtime` 默认 `auto`：GGUF 地�
 |---|---|---|---|
 | llama.cpp CPU | `ghcr.io/ggml-org/llama.cpp:server` | 0.31 GB | 约 1 GB |
 | llama.cpp GPU | `ghcr.io/ggml-org/llama.cpp:server-cuda` | 2.60 GB | 约 5–6 GB |
-| vLLM | `vllm/vllm-openai:v0.32.0-cu129` | 11.18 GB | 约 20–25 GB |
+| vLLM | `vllm/vllm-openai:v0.32.0` | 9.21 GB | 约 20–25 GB |
 
-vLLM 体积大，是因为镜像里打进了整套运行时：CUDA runtime（cu129）、PyTorch 自带的另一份 CUDA 库，以及 vLLM 自己编译的 FlashAttention、paged-attention 和量化 kernel。llama.cpp 镜像里只有一个静态编译的二进制和最小运行库，所以小一个数量级。
+vLLM 体积大，是因为镜像里打进了整套运行时：CUDA 13 runtime、PyTorch 自带的另一份 CUDA 库，以及 vLLM 自己编译的 FlashAttention、paged-attention 和量化 kernel。llama.cpp 镜像里只有一个静态编译的二进制和最小运行库，所以小一个数量级。
 
 压缩大小取自镜像仓库的 manifest；落盘大小是解包后的估算（CUDA 类镜像通常膨胀到 2 倍左右）。按 vLLM 规划节点时至少预留：
 
@@ -48,7 +50,7 @@ vLLM 体积大，是因为镜像里打进了整套运行时：CUDA runtime（cu1
 - `/dev/shm`：上限是推理容器内存 limit 的一半
 - 建议合计预留 **40 GB 以上**
 
-拉取耗时由带宽决定：11.18 GB 在 20 MB/s 下约 10 分钟，5 MB/s 下约 37 分钟。先确认空间：
+拉取耗时由带宽决定：9.21 GB 在 20 MB/s 下约 8 分钟，5 MB/s 下约 31 分钟。先确认空间：
 
 ```sh
 df -h /var/lib/rancher   # k3s 的 containerd 镜像默认落在这里

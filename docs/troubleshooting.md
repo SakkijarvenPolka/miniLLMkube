@@ -61,6 +61,13 @@ kubectl describe model <name>
 
 当 `phase` 进入 `Failed` 且原因发生变化时，controller 会发一条 Warning 事件，reason 与上表一致，方便 `kubectl get events --field-selector reason=DownloadFailed` 这类筛选。原因不变不会重复刷事件。
 
+### vLLM 容器反复重启：`libnvrtc.so.13: cannot open shared object file`
+
+镜像 `vllm/vllm-openai:*‑cu129` 打包的 torchcodec 是按 CUDA 13 编译的，而镜像自带 CUDA 12.9
+运行库，容器导入 `torchcodec` 时即崩溃（[vllm#60406](https://github.com/vllm-project/vllm/issues/60406)）。
+把 `spec.image` 换成 CUDA 13 构建的 `vllm/vllm-openai:v0.32.0`（需要 580 以上驱动），
+或改用等价的国内镜像地址。
+
 ## GPUOffload 条件
 
 请求 GPU 的 `Model` 会多一个 `GPUOffload` 条件，用来回答「GPU 真的用上了吗」：

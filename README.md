@@ -48,8 +48,8 @@ Model Controller（resolveBackend 决定 llama.cpp 或 vLLM）
 | | llama.cpp | vLLM |
 |---|---|---|
 | 模型格式 | GGUF | safetensors（`hf://`） |
-| 默认镜像 | `ghcr.io/ggml-org/llama.cpp:server` / `:server-cuda` | `vllm/vllm-openai:v0.32.0-cu129` |
-| 镜像压缩体积 | 0.31 GB / 2.60 GB | 11.18 GB |
+| 默认镜像 | `ghcr.io/ggml-org/llama.cpp:server` / `:server-cuda` | `vllm/vllm-openai:v0.32.0` |
+| 镜像压缩体积 | 0.31 GB / 2.60 GB | 9.21 GB |
 | 适合 | 单机小模型、CPU 也能跑、启动快 | 大模型、高吞吐、continuous batching |
 | 状态 | 已在单节点集群上跑通 | 代码完成，集群验收未执行 |
 
