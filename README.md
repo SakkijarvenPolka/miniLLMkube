@@ -19,10 +19,10 @@ miniLLMkube 把这些动作收进一个自定义资源里。用户只关心模�
 
 ## 核心能力
 
-- **双后端、单 CRD**：支持 `llama.cpp`（GGUF）和 vLLM（safetensors）。`spec.runtime` / `spec.format` 默认 `auto`，能从 `source` 推断的不用手写；`vllm + gguf` 这类非法组合在 CEL 层直接拒绝。
-- **下载与缓存隔离**：模型由 initContainer 下载到 `/models/<cacheKey>/`，每个 `source` 独立目录；`flock` 让多副本只有一个真正下载，`.tmp` 加断点续传，GGUF 校验魔数、safetensors 校验配置与全部分片，通过后才算缓存命中。
+- **双后端、单 CRD**：支持 `llama.cpp`（GGUF）和 vLLM（safetensors）。`spec.runtime` / `spec.format` 默认 `auto`，能从 `source` 推断的不用手写；`vllm + gguf` 这类非法组合在 CEL 层直接拒绝。两个后端都已在单节点 K3s 上跑通。
+- **下载与缓存隔离**：模型由 initContainer 下载到 `/models/<cacheKey>/`，每个 `source` 独立目录；`flock` 让多副本只有一个真正下载，`.tmp` 支持断点续传（外层重试 + `Content-Range` 校验，大文件中断不会从 0 重来），GGUF 校验魔数、safetensors 校验配置与全部分片，通过后才算缓存命中。
 - **GPU 推理**：`spec.gpu` 请求 `nvidia.com/gpu`、自动切换 CUDA 镜像、追加 `--n-gpu-layers`，并从推理日志确认 GPU 是否真的生效（`GPUOffload` 条件）。
-- **状态与诊断**：维护 `Pending` / `Deploying` / `Ready` / `Failed`；Pod 卡住时给出 `DownloadFailed`、`FormatMismatch`、`ImagePullFailed`、`InsufficientGPU`、`Unschedulable`、`RuntimeCrashing` 中的具体原因，原因变化时发 Warning 事件。
+- **状态与诊断**：维护 `Pending` / `Deploying` / `Ready` / `Failed` / `ScaledToZero`；Pod 卡住时给出 `DownloadFailed`、`FormatMismatch`、`ImagePullFailed`、`InsufficientGPU`、`Unschedulable`、`RuntimeCrashing` 中的具体原因，原因变化时发 Warning 事件。
 - **服务暴露**：创建 ClusterIP Service，集群内访问地址写入 `status.endpoint`，接口兼容 OpenAI。
 - **放置与缓存复用**：`nodeSelector` / `tolerations` / `affinity` / `schedulerName` 原样透传；`MODEL_CACHE_HOST_PATH` 可让开发环境复用宿主机缓存。
 
@@ -48,12 +48,27 @@ Model Controller（resolveBackend 决定 llama.cpp 或 vLLM）
 | | llama.cpp | vLLM |
 |---|---|---|
 | 模型格式 | GGUF | safetensors（`hf://`） |
-| 默认镜像 | `ghcr.io/ggml-org/llama.cpp:server` / `:server-cuda` | `vllm/vllm-openai:v0.32.0` |
+| 默认镜像 | `ghcr.io/ggml-org/llama.cpp:server` / `:server-cuda` | `vllm/vllm-openai:v0.32.0`（CUDA 13，需驱动 ≥ 580） |
 | 镜像压缩体积 | 0.31 GB / 2.60 GB | 9.21 GB |
-| 适合 | 单机小模型、CPU 也能跑、启动快 | 大模型、高吞吐、continuous batching |
-| 状态 | 已在单节点集群上跑通 | 代码完成，集群验收未执行 |
+| 适合 | 单机小模型、CPU 也能跑、单流延迟低、启动快 | 高并发、continuous batching、吞吐优先 |
+| 实测（2B，单卡 12 GB） | 单流约 140~150 tok/s，启动约 40 秒 | 单流约 104 tok/s、4 并发 316 tok/s，启动约 3 分钟 |
 
-参数、资源预留和 vLLM 的 `/dev/shm`、环境变量等细节见 [docs/backends.md](docs/backends.md)。
+## 实测结果（单节点 K3s）
+
+环境：k3s v1.36.5 单节点，RTX 5070 Ti Laptop（12227 MiB，驱动 591.86，sm_120，带宽 672 GB/s），WSL2，hostPath 缓存 `/var/lib/minillmkube/models`。同一模型家族分别验证两条路径，覆盖 apply → 下载权重 → 启动 → 就绪 → 集群内访问 → 推理全链路。
+
+| 项 | llama.cpp | vLLM |
+|---|---|---|
+| 模型 | `unsloth/Qwen3.5-2B-GGUF` 的 `Q8_0`（1.92 GB） | `Qwen/Qwen3.5-2B` safetensors（4.55 GB） |
+| 上下文 | 32K | 32K（KV cache 274k tokens，32K 并发 8.37x） |
+| 显存 | 由 llama.cpp 自行分配 | 约 10.5 GiB（权重+非 torch 4.75、峰值激活 1.9、CUDA graph 0.13、KV 3.49） |
+| 启动到 Ready | 约 40 秒 | 2 分 57 秒（引擎初始化含 CUDA graph 捕获） |
+| 单流解码 | 约 140~150 tok/s | 约 104 tok/s |
+| 首 token | — | 冷 160 ms / 热 23 ms |
+| 4 并发聚合 | — | 316 tok/s |
+| `GPUOffload` | `True` / `OffloadDetected` | `Unknown` / `NotDetected`（该条件仅对 llama.cpp 生效） |
+
+关于 vLLM 单流只有 ~104 tok/s：单流解码每生成一个 token 要把权重读一遍，`672 GB/s ÷ 4.55 GB ≈ 148 tok/s` 就是 BF16 权重的带宽上限，实测已到 70%。vLLM 优化的是吞吐而不是单流延迟；要 300+ tok/s 的单流，应该改用 llama.cpp + Q4 量化、FP8 权重或更小的模型。
 
 ## 快速开始
 
@@ -86,7 +101,7 @@ curl -s http://localhost:8080/v1/chat/completions \
 
 第一次启动会下载模型，时间取决于网络和模型大小。controller 把 `progressDeadlineSeconds` 设为 1800 秒，避免慢网络下过早判定失败。
 
-需要复用已下载的模型、开启 GPU、或换 vLLM 后端时，见 [docs/model-reference.md](docs/model-reference.md)。
+需要复用已下载的模型、开启 GPU 或换 vLLM 后端时，参考下面的示例与 `config/samples/`。
 
 ## 部署到真实集群
 
@@ -96,30 +111,45 @@ make deploy IMG=<你的镜像仓库>/minillmkube:tag
 kubectl apply -f config/samples/llm_v1alpha1_model.yaml
 ```
 
-本地开发更推荐 `make run`，调试 controller 更方便。
+本地开发更推荐 `make run`，调试 controller 更方便。单节点 GPU 验证时用集群外运行也很方便：
+
+```sh
+MODEL_CACHE_HOST_PATH=/var/lib/minillmkube/models \
+GPU_RUNTIME_CLASS=nvidia \
+HF_ENDPOINT=https://hf-mirror.com \
+./bin/manager --metrics-bind-address=:8081
+```
+
+## GPU 与 vLLM 的坑
+
+- **vLLM 必须用 CUDA 13 镜像**：`v0.32.0-cu129` 内含按 CUDA 13 编译的 torchcodec，而运行时只有 CUDA 12.9，容器 import 阶段就会报 `libnvrtc.so.13: cannot open shared object file`（上游 vllm#60406）。默认 tag 已固定为 `vllm/vllm-openai:v0.32.0`，要求驱动 ≥ 580。
+- **下载器镜像跟随 `spec.image`**：vLLM 下载器需要镜像内的 `hf` CLI，覆盖镜像后下载器也会跟着换；同时自动注入 `HF_HUB_DISABLE_XET=1`，避免 Xet 影子域名绕过 `HF_ENDPOINT` 后 401。
+- **`/dev/shm` 只有 64 MiB**：vLLM 多进程启动会失败，operator 会挂 `emptyDir{medium: Memory}`，大小取内存 limit 的一半。
+- **WSL2 默认关闭 pinned memory**：需要时给 operator 设 `ENABLE_WSL2_VLLM_PIN_MEMORY=true`，它会给 vLLM 容器注入 `VLLM_WSL2_ENABLE_PIN_MEMORY=1`。
+- **端口别撞**：operator 自身 metrics 默认 `:8081`，Service 是 8080；宿主被占用时换 `--metrics-bind-address`，服务侧验证最稳的是在 Pod 内直连 `127.0.0.1:8080`。
+- **单卡整数配额**：`nvidia.com/gpu` 不可切分，两个 GPU 服务不能同时跑；GPU 副本按 `Recreate` 更新，避免旧 Pod 占着显存不放。
 
 ## 状态与排障
 
-`status.phase` 有五种：`Pending`（Deployment 已创建、尚未被观测）、`Deploying`（滚动中）、`Ready`（当前 generation 全部可用）、`Failed`（规格非法或 Deployment 报失败）、`ScaledToZero`（`spec.replicas` 为 0，Ready 条件为 False；缩容过程中 reason 为 `ScalingDown`，副本全部退出后为 `ScaledToZero`）。
+`status.phase` 有五种：
 
-`status.conditions` 里的 `Ready` 会带上失败原因；请求 GPU 时另有 `GPUOffload` 条件，用来区分「真的用上了 GPU」和「静默退回 CPU」。
+- `Pending`：Deployment 已创建、尚未被观测。
+- `Deploying`：滚动中。
+- `Ready`：当前 generation 全部可用。
+- `Failed`：规格非法或 Deployment 报失败。
+- `ScaledToZero`：`spec.replicas` 为 0；Ready 条件为 False，缩容过程中 reason 为 `ScalingDown`，副本全部退出后为 `ScaledToZero`。
 
-完整说明和常见场景见 [docs/troubleshooting.md](docs/troubleshooting.md)。
-
-## 文档
-
-- [docs/ROADMAP.md](docs/ROADMAP.md)：开发计划、任务分解、进度表与边界问题清单
-- [docs/backends.md](docs/backends.md)：两种后端的参数、镜像体积与资源要求
-- [docs/model-reference.md](docs/model-reference.md)：`Model` 字段说明与缓存语义
-- [docs/troubleshooting.md](docs/troubleshooting.md)：状态、诊断原因与排障
+`status.conditions` 里的 `Ready` 会带上失败原因（下载失败、镜像拉取失败、格式不匹配、调度失败、GPU 不足、反复崩溃等）；请求 GPU 时另有 `GPUOffload` 条件，用来区分「真的用上了 GPU」和「静默退回 CPU」。`status.endpoint` 是集群内访问地址。
 
 ## 当前边界
 
-M1～M5 的代码已完成（当前在 `feat/m3-m4` 分支，尚未合入 `main`），本地 `make test` / `make lint` 通过。llama.cpp 侧已在单节点 K3s（RTX 5070 Ti Laptop，12 GB 显存）上跑通完整链路：权重下载与缓存命中 → GPU 推理 → Service 访问 → `GPUOffload=True`；**vLLM 侧的集群验收仍未执行**。
+M1～M5 已完成并合入 `main`；llama.cpp 与 vLLM 两条路径都已在单节点 K3s 上跑完整链路（2B 模型）。本地 `make test` / `make lint` 通过，CI 的 lint 任务已修正 Go 版本。
 
 - 暂未做多模型路由，暂未提供 Helm Chart。
-- GPU 只做到「资源请求 + RuntimeClass 透传 + 日志确认」，不感知显卡型号和驱动版本，不做多卡切分；GPU 副本按 `Recreate` 更新，避免旧 Pod 占着显卡不放。
-- vLLM 后端代码已完成，但 M3-T0 的 Blackwell + WSL2 手动 Pod 探查和集群推理验收尚未执行；启动探针阈值、GPU 显存利用率都还是估计值。
+- GPU 只做到「资源请求 + RuntimeClass 透传 + 日志确认」，不感知显卡型号和驱动版本，不做多卡切分。
+- 单卡 GPU 按整数配额分配，两个 GPU 服务不能并行；需要并行只能一个走 GPU、一个走 CPU。
+- M5 的外部调度器只验证了字段透传，尚未在真实调度器上验收。
+- 前缀缓存在 Qwen3.5-2B（混合线性注意力/Mamba 架构）上未观察到实际生效。
 - 放置字段只透传不校验：填错 `nodeSelector` 会表现成 `Unschedulable`，不会在 admission 阶段被拒绝。
 
 ## 开发常用命令

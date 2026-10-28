@@ -28,3 +28,6 @@ go.work
 
 # Kubeconfig might contain secrets
 *.kubeconfig
+
+# 开发文档不随仓库提供（本地保存在 ../miniLLMkube-docs/）
+docs/
