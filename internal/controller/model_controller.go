@@ -66,6 +66,15 @@ const (
 	phaseDeploying = "Deploying"
 	phaseReady     = "Ready"
 	phaseFailed    = "Failed"
+
+	// phaseScaledToZero marks a Model whose spec.replicas is 0: no Pod serves
+	// the Model, so it is neither ready nor failed.
+	phaseScaledToZero = "ScaledToZero"
+
+	// reasonScaledToZero and reasonScalingDown explain whether the GPU has been
+	// released already or a terminating replica still holds it.
+	reasonScaledToZero = "ScaledToZero"
+	reasonScalingDown  = "ScalingDown"
 )
 
 type rolloutState struct {
@@ -189,7 +198,9 @@ func (r *ModelReconciler) withPodDiagnosis(
 	model *llmv1alpha1.Model,
 	state rolloutState,
 ) (rolloutState, error) {
-	if state.phase == phaseReady {
+	// A scaled-to-zero Model has no serving Pod by design, so there is nothing
+	// to diagnose; a terminating Pod must not turn the idle state into Failed.
+	if state.phase == phaseReady || state.phase == phaseScaledToZero {
 		return state, nil
 	}
 
@@ -436,6 +447,9 @@ func validateSpec(model *llmv1alpha1.Model) error {
 }
 
 func evaluateRollout(deployment *appsv1.Deployment, desiredReplicas int32) rolloutState {
+	if desiredReplicas == 0 {
+		return scaledToZeroState(deployment)
+	}
 	if reason, message, failed := deploymentFailure(deployment); failed {
 		return rolloutState{
 			phase:   phaseFailed,
@@ -465,6 +479,26 @@ func evaluateRollout(deployment *appsv1.Deployment, desiredReplicas int32) rollo
 		status:  metav1.ConditionFalse,
 		reason:  "DeploymentProgressing",
 		message: fmt.Sprintf("Waiting for %d replica(s) to become ready", desiredReplicas),
+	}
+}
+
+// scaledToZeroState reports a Model that asked for no replica. Reporting Ready
+// with zero serving Pods would be wrong, and the terminating replica is called
+// out because it is the last thing between the Model and a free GPU.
+func scaledToZeroState(deployment *appsv1.Deployment) rolloutState {
+	if deployment.Status.Replicas > 0 {
+		return rolloutState{
+			phase:   phaseScaledToZero,
+			status:  metav1.ConditionFalse,
+			reason:  reasonScalingDown,
+			message: fmt.Sprintf("Waiting for %d replica(s) to terminate", deployment.Status.Replicas),
+		}
+	}
+	return rolloutState{
+		phase:   phaseScaledToZero,
+		status:  metav1.ConditionFalse,
+		reason:  reasonScaledToZero,
+		message: "replicas is 0, inference is disabled",
 	}
 }
 

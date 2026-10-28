@@ -267,6 +267,7 @@ func TestGPUConditions(t *testing.T) {
 	cudaLog := testCUDADeviceLine
 	cpuLog := testCPUDeviceLine
 	ready := rolloutState{phase: phaseReady}
+	zero := int32(0)
 
 	tests := []struct {
 		name       string
@@ -305,6 +306,13 @@ func TestGPUConditions(t *testing.T) {
 			logText:    cpuLog,
 			wantStatus: metav1.ConditionFalse,
 			wantReason: gpuReasonCPUFallback,
+		},
+		{
+			name:       "scaled to zero",
+			spec:       llmv1alpha1.ModelSpec{GPU: &llmv1alpha1.GPUSpec{Count: 1, Layers: 99}, Replicas: &zero},
+			state:      rolloutState{phase: phaseScaledToZero},
+			wantStatus: metav1.ConditionUnknown,
+			wantReason: gpuReasonNotDetected,
 		},
 	}
 

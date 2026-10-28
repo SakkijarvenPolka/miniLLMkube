@@ -76,7 +76,7 @@ spec:
 
 ## 状态字段
 
-- `status.phase`：`Pending`、`Deploying`、`Ready`、`Failed`。
+- `status.phase`：`Pending`、`Deploying`、`Ready`、`Failed`、`ScaledToZero`（`spec.replicas` 为 0；缩容中 reason 为 `ScalingDown`，副本退出后为 `ScaledToZero`，Ready 条件始终为 False）。
 - `status.endpoint`：Service 的集群内地址。
 - `status.resolvedRuntime` / `status.resolvedFormat`：auto 解析结果。
 - `status.cacheKey`：当前 source 对应的缓存目录名。

@@ -129,7 +129,7 @@ type GPUSpec struct {
 
 // ModelStatus defines the observed state of Model
 type ModelStatus struct {
-	// Phase 人类可读的状态概览: Pending / Deploying / Ready / Failed
+	// Phase 人类可读的状态概览: Pending / Deploying / Ready / Failed / ScaledToZero（spec.replicas 为 0）
 	// +optional
 	Phase string `json:"phase,omitempty"`
 	// Endpoint 集群内 OpenAI 兼容接口地址

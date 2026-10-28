@@ -1258,7 +1258,8 @@ spec:
                 format: int64
                 type: integer
               phase:
-                description: 'Phase 人类可读的状态概览: Pending / Deploying / Ready / Failed'
+                description: 'Phase 人类可读的状态概览: Pending / Deploying / Ready / Failed
+                  / ScaledToZero（spec.replicas 为 0）'
                 type: string
               readyReplicas:
                 description: ReadyReplicas 就绪副本数

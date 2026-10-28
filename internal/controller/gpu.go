@@ -28,6 +28,10 @@ const (
 	gpuDeviceCUDA = "CUDA"
 	gpuDeviceCPU  = "CPU"
 
+	// scaledToZeroGPUOffloadMessage replaces the device-line verdict while no
+	// inference Pod exists.
+	scaledToZeroGPUOffloadMessage = "Scaled to zero: there is no inference Pod to inspect"
+
 	gpuReasonDetected    = "OffloadDetected"
 	gpuReasonCPUFallback = "CPUFallback"
 	gpuReasonNotDetected = "NotDetected"
@@ -234,6 +238,18 @@ func (r *ModelReconciler) gpuConditions(
 ) []metav1.Condition {
 	if !wantsGPU(model) {
 		return nil
+	}
+
+	// Nothing runs at replicas 0, so the log-based verdict is reset instead of
+	// keeping the offload state of a Pod that no longer exists.
+	if replicasFor(model) == 0 {
+		return []metav1.Condition{{
+			Type:               gpuOffloadConditionType,
+			Status:             metav1.ConditionUnknown,
+			Reason:             gpuReasonNotDetected,
+			ObservedGeneration: model.Generation,
+			Message:            truncateDiagnosisMessage(scaledToZeroGPUOffloadMessage),
+		}}
 	}
 
 	condition := metav1.Condition{

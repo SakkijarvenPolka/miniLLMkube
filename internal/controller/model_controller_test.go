@@ -278,6 +278,63 @@ var _ = Describe("Model Controller", func() {
 			Expect(model.Status.Phase).To(Equal("Ready"))
 		})
 
+		It("reports a scaled-to-zero Model instead of claiming readiness", func() {
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			zero := int32(0)
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			model.Spec.Replicas = &zero
+			Expect(k8sClient.Update(ctx, model)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			Expect(deployment.Spec.Replicas).To(HaveValue(Equal(int32(0))))
+
+			By("waiting for the terminating replica while the Deployment still runs one")
+			deployment.Status.ObservedGeneration = deployment.Generation
+			deployment.Status.Replicas = 1
+			deployment.Status.UpdatedReplicas = 0
+			Expect(k8sClient.Status().Update(ctx, deployment)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal("ScaledToZero"))
+			Expect(meta.IsStatusConditionFalse(model.Status.Conditions, "Ready")).To(BeTrue())
+			Expect(model.Status.Conditions).To(ContainElement(WithTransform(func(condition metav1.Condition) string {
+				return condition.Reason
+			}, Equal("ScalingDown"))))
+
+			By("reporting an idle Model once every replica is gone")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			deployment.Status.Replicas = 0
+			deployment.Status.UpdatedReplicas = 0
+			deployment.Status.AvailableReplicas = 0
+			deployment.Status.ReadyReplicas = 0
+			Expect(k8sClient.Status().Update(ctx, deployment)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal("ScaledToZero"))
+			Expect(model.Status.ReadyReplicas).To(BeZero())
+			Expect(model.Status.Conditions).To(ContainElement(WithTransform(func(condition metav1.Condition) string {
+				return condition.Reason
+			}, Equal("ScaledToZero"))))
+		})
+
 		It("marks a deployment progress deadline as Failed", func() {
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,

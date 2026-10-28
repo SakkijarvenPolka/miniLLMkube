@@ -100,7 +100,7 @@ kubectl apply -f config/samples/llm_v1alpha1_model.yaml
 
 ## 状态与排障
 
-`status.phase` 有四种：`Pending`（Deployment 已创建、尚未被观测）、`Deploying`（滚动中）、`Ready`（当前 generation 全部可用）、`Failed`（规格非法或 Deployment 报失败）。
+`status.phase` 有五种：`Pending`（Deployment 已创建、尚未被观测）、`Deploying`（滚动中）、`Ready`（当前 generation 全部可用）、`Failed`（规格非法或 Deployment 报失败）、`ScaledToZero`（`spec.replicas` 为 0，Ready 条件为 False；缩容过程中 reason 为 `ScalingDown`，副本全部退出后为 `ScaledToZero`）。
 
 `status.conditions` 里的 `Ready` 会带上失败原因；请求 GPU 时另有 `GPUOffload` 条件，用来区分「真的用上了 GPU」和「静默退回 CPU」。
 
