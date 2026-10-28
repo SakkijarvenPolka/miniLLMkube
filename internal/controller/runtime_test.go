@@ -309,10 +309,11 @@ func TestVllmDownloader(t *testing.T) {
 		t.Fatalf("downloader image = %q, want %q", container.Image, vllmImage)
 	}
 	for name, want := range map[string]string{
-		"MODEL_REPO":     "Qwen/Qwen3-0.6B",
-		"MODEL_REVISION": "v1.0",
-		"MODEL_DIR":      "/models/" + cacheKeyFor(testHFSource+"@v1.0"),
-		hfEndpointEnv:    "https://hf-mirror.com",
+		"MODEL_REPO":         "Qwen/Qwen3-0.6B",
+		"MODEL_REVISION":     "v1.0",
+		"MODEL_DIR":          "/models/" + cacheKeyFor(testHFSource+"@v1.0"),
+		hfEndpointEnv:        "https://hf-mirror.com",
+		"HF_HUB_DISABLE_XET": "1",
 	} {
 		if got := envValue(container.Env, name); got != want {
 			t.Fatalf("%s = %q, want %q", name, got, want)
@@ -320,5 +321,13 @@ func TestVllmDownloader(t *testing.T) {
 	}
 	if len(container.Args) != 1 || container.Args[0] != downloadScriptSafetensors {
 		t.Fatalf("downloader args are not the safetensors script: %+v", container.Args)
+	}
+
+	overridden := testModel(llmv1alpha1.ModelSpec{
+		Source: testHFSource,
+		Image:  "registry-1.docker.io/vllm/vllm-openai:v0.32.0-cu129",
+	})
+	if got := (vllmBackend{}).Downloader(overridden).Image; got != overridden.Spec.Image {
+		t.Fatalf("downloader image = %q, want spec image %q", got, overridden.Spec.Image)
 	}
 }

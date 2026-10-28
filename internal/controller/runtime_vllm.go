@@ -28,10 +28,14 @@ import (
 )
 
 const (
-	// vllmImage is the vLLM OpenAI-compatible server. The tag is pinned and
-	// built on CUDA 12.9, which the operator's target driver supports; nightly
-	// builds need a newer driver (F13).
-	vllmImage = "vllm/vllm-openai:v0.32.0-cu129"
+	// vllmImage is the vLLM OpenAI-compatible server. The tag is pinned (F13).
+	//
+	// The "-cu129" variants of this image are broken: they bundle a torchcodec
+	// built against CUDA 13 while shipping a CUDA 12.9 runtime, so the container
+	// dies at import time with "libnvrtc.so.13: cannot open shared object file"
+	// (vllm-project/vllm#60406). The default tag is the CUDA 13 build and needs
+	// driver 580 or newer; the operator's target node runs 591.86.
+	vllmImage = "vllm/vllm-openai:v0.32.0"
 
 	// vllmStartupFailureThreshold is 240 probes x 5s = 20 minutes. vLLM loads
 	// the weights and captures CUDA graphs on startup, which takes minutes even
@@ -129,10 +133,15 @@ func (vllmBackend) Downloader(model *llmv1alpha1.Model) corev1.Container {
 	if endpoint := os.Getenv(hfEndpointEnv); endpoint != "" {
 		env = append(env, corev1.EnvVar{Name: hfEndpointEnv, Value: endpoint})
 	}
+	// Xet 存储后端不经过 HF_ENDPOINT 镜像，走影子域名会 401 Unauthorized；
+	// 统一回退到普通 HTTP 下载，镜像场景下才能正常拉取权重。
+	env = append(env, corev1.EnvVar{Name: "HF_HUB_DISABLE_XET", Value: "1"})
 
 	return corev1.Container{
-		Name:                     downloaderContainerName,
-		Image:                    vllmImage,
+		Name: downloaderContainerName,
+		// The downloader needs the Hugging Face CLI bundled in the vLLM image,
+		// so it follows an image override instead of the pinned default.
+		Image:                    imageFor(model),
 		ImagePullPolicy:          corev1.PullIfNotPresent,
 		Command:                  []string{"sh", "-c"},
 		Args:                     []string{downloadScriptSafetensors},
