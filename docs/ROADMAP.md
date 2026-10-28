@@ -1,6 +1,6 @@
 # miniLLMkube 开发计划（v3，agent 可执行版）：GPU 推理 + vLLM/llama.cpp 双引擎
 
-> 状态：规划文档，尚未改代码。基线提交 `cd79cde`，日期 2026-10-25。
+> 状态：代码实现与审查修复完成；原始计划基线为 `cd79cde`（2026-10-25），当前进度以第 6 章为准。llama.cpp 与 vLLM 两侧均已通过单节点集群验证（2026-10-28/29）；M3-T0 结论见 M3 节，M5 外部调度器仍未验收。
 > 读者：负责执行开发的 agent。按任务编号推进，一个任务一个提交，完成后更新第 6 章。
 > 本版已把上一版所有「实现时再确认」的事项实测落定（第 2 章 F1~F14，全部带证据）；除第 9 章列出的少数优化项外，任务里的代码与命令可以直接照写执行。
 > 第 7~9 章沿用上一版并小幅修订（E20），各任务按编号引用。
@@ -91,7 +91,7 @@
 | F10 | llama.cpp `server-cuda`（build 11804）实测（2026-10-25）：默认 verbosity 3 时 GPU 与 CPU 完全同日志（11 行，无法区分）；加 `-lv 5` 后出现 `ggml_cuda_init: found 1 CUDA devices`、`llama_prepare_model_devices: using device CUDA0 (NVIDIA GeForce RTX 5070 Ti Laptop GPU)`、`load_tensors: layer N assigned to device CUDA0`。**无 GPU 时同一镜像不报错**，`-lv 5` 下显示 `using device CPU` 和 `assigned to device CPU`（D5 探针）。另外默认就是全量 offload：不加 `--n-gpu-layers` 也用 CUDA（D1/D2 日志与 nvidia-smi 显存占用一致） | M2-T4 检测方案定型：GPU Pod 追加 `-lv 5` + 控制器扫日志。`--n-gpu-layers` 仍显式传（可移植性）。`-lv 5` 启动日志约 4300 行/0.6B 模型，只在 Ready 后扫一次 |
 | F11 | client-go v0.35.0 存在 `events.NewFakeRecorder(bufferSize int) *FakeRecorder`（`tools/events/fake.go:48`），`Events` 字段是 `chan string` | M4-T2 测试直接用，不用再确认 |
 | F12 | BusyBox 实测（2026-10-25）：`wc -c < f` 输出无前导空格；`find -maxdepth 1 -name '*.tmp' ! -name X -exec rm -f {} +` 语义正确；Pod 内 `curl -fsIL` + sed 解析 hf-mirror 的 Content-Length 得到 639446688 | M1 下载脚本原样可用；等长 `.tmp` 的 `curl -C -` 行为无需再验证（脚本已先删） |
-| F13 | vLLM 官方镜像 tag（hub API 经代理查询，2026-10-25）：稳定版 `v0.32.0`，有 `cu129` 变体；nightly 是 cu134 构建（CUDA 13.4 > 本机驱动 591.86/CUDA 13.1，**不能用**）。cu129（12.9 ≤ 13.1）符合驱动向后兼容 | M3-T0 固定用 `vllm/vllm-openai:v0.32.0-cu129`，不要用 latest/nightly |
+| F13 | vLLM 官方镜像 tag（2026-10-28 实测）：`v0.32.0` 是 CUDA 13 构建（9.21 GB，驱动需 ≥580，本机 591.86 可用）；`-cu129` 变体打包的 torchcodec 按 CUDA 13 编译，容器启动即报 `libnvrtc.so.13` 缺失（vllm#60406），**不能用** | 固定用 `vllm/vllm-openai:v0.32.0`，不要用 `-cu129` 变体或 nightly |
 | F14 | `llama-server --help` 确认存在：`-ngl/--gpu-layers/--n-gpu-layers N`、`-a/--alias`、`--metrics`、`-lv/--verbosity N`（另有 env `LLAMA_ARG_LOG_VERBOSITY`） | E17 用 `--alias` 落地；`hasFlag` 去重必须同时匹配长/短别名（E16） |
 
 ## 3. 目标代码结构
@@ -399,7 +399,8 @@ var gpuDeviceRe = regexp.MustCompile(`llama_prepare_model_devices: using device 
 func parseGPUDevice(logText string) (string, bool)
 
 // scanGPUOffload 在 rollout Ready 后调用一次：List 属于该 Model 的 Pod，取第一个
-// Running 的推理 Pod，读取日志（PodLogOptions{TailLines: 1000, LimitBytes: 512KiB}，E34），
+// Running 的推理 Pod，读取日志（PodLogOptions{SinceTime: pod.CreationTimestamp, LimitBytes: 512KiB}；
+// 不用 TailLines：`-lv 5` 启动日志超过 tail 窗口，设备行会被截掉，见 6.2），
 // 交给 parseGPUDevice。日志读失败返回 error，不猜测。
 func (r *ModelReconciler) scanGPUOffload(ctx context.Context, m *llmv1alpha1.Model) (string, bool, error)
 ```
@@ -427,7 +428,7 @@ func (r *ModelReconciler) scanGPUOffload(ctx context.Context, m *llmv1alpha1.Mod
 
 **M3-T0 vLLM 本机可行性探查（必须先做，结论写回本节）**
 
-先手动起一个 Pod 验证，不经过 operator：`runtimeClassName: nvidia`、`nvidia.com/gpu: 1`，**镜像固定 `vllm/vllm-openai:v0.32.0-cu129`**（F13：稳定版 v0.32.0；cu129=CUDA 12.9 ≤ 本机驱动 13.1；**不要用 latest 或 nightly**——nightly 是 cu134 构建，驱动不够）。模型选 `Qwen/Qwen3-0.6B`（safetensors，经 `HF_ENDPOINT=https://hf-mirror.com` 下载），环境变量 `VLLM_WSL2_ENABLE_PIN_MEMORY=1`，`/dev/shm` 挂内存 emptyDir。镜像约 20GB，经 daocloud 镜像拉取（0.6 节），预留 30~60 分钟。
+先手动起一个 Pod 验证，不经过 operator：`runtimeClassName: nvidia`、`nvidia.com/gpu: 1`，**镜像固定 `vllm/vllm-openai:v0.32.0`**（F13：CUDA 13 构建，驱动 591.86 可用；**不要用 `-cu129` 变体**——torchcodec 与运行时 CUDA 版本不匹配，启动即崩）。模型选 `Qwen/Qwen3-0.6B`（safetensors，经 `HF_ENDPOINT=https://hf-mirror.com` 下载），环境变量 `VLLM_WSL2_ENABLE_PIN_MEMORY=1`，`/dev/shm` 挂内存 emptyDir。镜像约 20GB，经 daocloud 镜像拉取（0.6 节），预留 30~60 分钟。
 
 需要记录（按序）：
 
@@ -436,6 +437,19 @@ func (r *ModelReconciler) scanGPUOffload(ctx context.Context, m *llmv1alpha1.Mod
 3. 能否在 Blackwell + WSL2 上启动；冷启动到 `/health` 返回 200 的时间（作为 `FailureThreshold` 依据）。
 4. 镜像 entrypoint 与完整参数名（`--model --served-model-name --host --port --max-model-len --gpu-memory-utilization` 是否如 M3-T4 所列）。
 5. 是否自带 `huggingface-cli` 或 `hf` 命令（决定下载器能否复用该镜像）。
+
+**结论（2026-10-29，单节点集群实测）**
+
+1. **Blackwell（sm_120）可用**：CUDA 13 构建 `vllm/vllm-openai:v0.32.0` 加载 Qwen3.5-2B 并正常推理，无 "no kernel image" 报错。`-cu129` 变体不可用——其 torchcodec 按 CUDA 13 编译，容器启动即报 `libnvrtc.so.13: cannot open shared object file`（vllm#60406），默认 tag 因此改为 `v0.32.0`。
+2. **镜像**：9,205,780,771 字节（压缩 9.21 GB），经 SWR 的 docker.io 镜像站拉取耗时 20 分 40 秒。
+3. **冷启动**：容器启动到 Ready 约 2 分 57 秒，其中引擎初始化（profile + KV cache + CUDA graph 捕获）120 秒；`vllmStartupFailureThreshold=240`（20 分钟）余量充足，暂不调整。
+4. **端口与健康**：`--host :: --port 8080`；`/health` 200、`/v1/models` 正常、`/metrics` 暴露 Prometheus 指标。
+5. **端点探测**：`/v1/stores`、`/stores` 等均 404；`x-prompt-cache-key` 请求头被忽略（不报错、无效果）。
+6. **前缀缓存**：引擎默认 `enable_prefix_caching=True`，但重复提交完全相同的 prompt（208~220 tokens）后 `vllm:prefix_cache_hits_total` 始终为 0；Qwen3.5 为混合线性注意力（Mamba）架构，0.32.0 下未观察到实际复用，验收结论需按此口径描述。
+7. **显存**：`--gpu-memory-utilization 0.85` → 目标 10.15 GiB；权重+非 torch 4.75 GiB、峰值激活 1.9 GiB、CUDA graph 0.13 GiB、KV cache 3.49 GiB（274,370 tokens，32K 上下文并发 8.37x）；`nvidia-smi` 约 10.5 GiB。
+8. **性能**（Qwen3.5-2B，关 thinking，temperature 0）：单请求 220-token prompt / 40 输出约 97 tok/s；4 并发聚合 316 tok/s。
+9. **参数与工具**：entrypoint 为 `vllm serve`，`--model --served-model-name --host --port --max-model-len --gpu-memory-utilization` 均有效；镜像自带 `hf` CLI，下载器复用同一镜像（跟随 `spec.image`），并设 `HF_HUB_DISABLE_XET=1`（Xet 走影子域名会 401）。
+10. **`/dev/shm`**：由 operator 注入内存 emptyDir；`VLLM_WSL2_PIN_MEMORY` 仅在 operator 环境显式打开时注入，本次未开，未观察到异常。
 
 **若启动失败，M3 暂停 vLLM 部分**，只做 T1~T3 的抽象层与 llama.cpp 后端，并在第 6 章记录失败证据。
 
@@ -482,7 +496,7 @@ func resolveBackend(m *Model) (Backend, string /*format*/, error)
 
 1. 显式 `runtime` 优先，`format` 为 auto 时按 runtime 推断。
 2. `runtime=auto` 时：`format=gguf` 或 source 是 https 且以 `.gguf` 结尾 → llamacpp；`format=safetensors` 或 source 以 `hf://` 开头 → vllm；其它返回错误，Reason 为 `InvalidSpec`。
-3. `validateSpec` 改为调用 `resolveBackend`，再按格式校验 source：gguf 要求 https 和 `.gguf` 后缀；safetensors 要求 `hf://<org>/<repo>`，可带 `@<revision>`。
+3. `validateSpec` 调用 `resolveBackend`，再按格式校验 source：gguf 要求主机名非空的 https URL 和 `.gguf` 后缀；safetensors 要求 `hf://<org>/<repo>`，可带 `@<revision>`。随后调用 `validateRuntimeGPU(m *llmv1alpha1.Model) error`：解析为 vLLM 时，`resourcesFor` 渲染的 `nvidia.com/gpu` limit 必须是有效正整数；`gpu: {}` 的零值 Count 仍默认 1，显式 limit 优先。纯 `resolveBackend` 不因无 GPU 而失败。
 
 **M3-T3 llama.cpp 后端**（`runtime_llamacpp.go`）
 
@@ -590,16 +604,42 @@ SchedulerName string              `json:"schedulerName,omitempty"`
 | M2-T2 渲染逻辑 | 已完成 | feat/m1 4c1fac6 | limits 同步镜像进 requests，否则存储模板与渲染结果永不相等（F9）；`-lv 5` 已加（F10） |
 | M2-T3 测试 | 已完成 | feat/m1 d042e51 | pod_builder 表驱动 12 例 + envtest（gpu:{} → limits=1、RuntimeClass=nil、`--n-gpu-layers 99`） |
 | M2-T4 GPU 生效检测 | 已完成 | feat/m1 9903109 | `GPUOffload` 条件 + 按 Pod UID 缓存观测；日志读失败记 Unknown 并打日志，不阻断 reconcile |
-| M3-T0 vLLM 探查 | 未开始 | | tag 用 v0.32.0-cu129；结论回写本节 |
-| M3-T1 API+CEL | 未开始 | | |
-| M3-T2 后端接口 | 未开始 | | |
-| M3-T3 llama.cpp 后端 | 未开始 | | |
-| M3-T4 vLLM 后端 | 未开始 | | |
-| M4-T1 诊断纯函数 | 未开始 | | 可与 M1 并行 |
-| M4-T2 接入 Reconcile | 未开始 | | |
-| M5 透传字段 | 未开始 | | |
+| M3-T0 vLLM 探查 | 部分完成 | | 已用 `vllm/vllm-openai:v0.32.0` 起 Pod 验证镜像可加载（`-cu129` 变体启动即崩，已改默认 tag）；`startupFailureThreshold` 仍为估计值 240，实测后改 |
+| M3-T1 API+CEL | 已完成 | feat/m3-m4 111fde3 | runtime/format 字段、两条 CEL、status.resolved*、printcolumn Runtime |
+| M3-T2 后端接口 | 已完成 | feat/m3-m4 94453fe | `runtime.go` 的 Backend 接口与 resolveBackend；validateSpec 改为按解析出的格式校验 source |
+| M3-T3 llama.cpp 后端 | 已完成 | feat/m3-m4 94453fe | 迁移 serverArgs 与 GPU 逻辑；绑 `::`；`--alias <CR 名>` |
+| M3-T4 vLLM 后端 | 已完成 | feat/m3-m4 94453fe、062263d | 参数/Env/PodMutations/下载脚本；`/dev/shm` 内存卷与 `enableServiceLinks=false`；2026-10-29 已用 Qwen3.5-2B 完成集群验证 |
+| M4-T1 诊断纯函数 | 已完成 | feat/m3-m4 f84b17a | `diagnose.go` 六级优先级 + 512 字节截断；单测覆盖每级与优先级 |
+| M4-T2 接入 Reconcile | 已完成 | feat/m3-m4 1c16129 | Pod 诊断覆盖状态、Pod watch、Reason 变化发 Warning；envtest 覆盖诊断与事件 |
+| M5 透传字段 | 已完成 | feat/m3-m4 e6ee5bd | `SchedulerName` 留空仍写 `default-scheduler`（F9）；放置字段不进 selector（E28）；外部调度器验收留待上集群 |
 
-M1、M2 的「集群验收」步骤本次未执行（用户要求暂不上集群），只完成到 `make test` / `make lint` 全绿。验收前需要按各任务节点核对一遍真实集群行为。
+**2026-10-28 更新**：llama.cpp 侧已在单节点 K3s（RTX 5070 Ti Laptop 12 GB）完成实际验证：下载 → 缓存命中 → GPU 推理（`GPUOffload=True/OffloadDetected`）→ Service 集群内访问，Qwen3.5-2B Q8_0、32K 上下文、约 150 tok/s。验证中发现并修复两个缺陷（大文件无法续传、GPU 日志 tail 窗口漏掉设备行），见下方 6.2。**2026-10-29 vLLM 侧也已完成集群验证**（镜像、启动、显存、性能与端点探测结果见 6.3）。
+
+其余「集群验收」步骤（M1/M2 的完整清单、M5 外部调度器）仍未执行。此前实现轮次记录 `make test` / `make lint` 全绿；此记录不替代修复后的测试。M3-T0 已于 2026-10-29 在单节点集群完成（见 6.3），M3-T4 相应转为已完成；M5 外部调度器与 WSL2 pin-memory 仍未验证。
+
+### 6.1 本轮审查修复（2026-10-26，提交 062263d）
+
+- GGUF source 拒绝空 Host/Hostname；vLLM 资源校验单独由 `validateRuntimeGPU` 承担，`validateSpec` 接入；解析层保留无 GPU 的后端解析能力。回归覆盖无 GPU 拒绝、`gpu: {}` 和有效 limit 通过、零/负/小数 limit 与仅 requests 拒绝。
+- 下载缓存增加 `.complete` 完成标记，并核验配置、索引全部分片和 tokenizer；未完整成功的目录不能当作缓存命中。source 缓存键不自动追踪可变上游，HF 应固定不可变 commit revision，GGUF 应使用不可变 URL。
+- README 明确非 llama.cpp 的 `GPUOffload=Unknown/NotDetected`、显式 RuntimeClass 在 CPU 模式也透传、llama.cpp 目前仅 GPU/日志 flag 去重，未宣称基础 flag 全部去重。
+- 其余 Reconcile、诊断与 GPU 观测修复以本轮代码和测试为准，已提交为 `062263d`。T0 与全部真实集群行为等待后续授权验证。
+
+### 6.2 集群验证修复（2026-10-28）
+
+llama.cpp 侧集群验证发现两个缺陷，已修复：
+
+- **大文件下载无法续传**：原脚本靠 `curl --retry`，失败后 `-C -` 的偏移被重试截断，导致每次都从头下载；总长又依赖 `HEAD` 的 `Content-Length`。改为脚本外层重试（最多 30 次）、用 `curl -r 0-0` 的 `Content-Range` 取总长、退出码 33 时删掉 `.tmp` 重来，403/416 视为远端已完成。实测 Qwen3.5-2B Q8_0（1.9 GB）在 1.3 GB 处反复停滞，修复后可从断点继续。
+- **`GPUOffload` 恒为 `NotDetected`**：`-lv 5` 的启动日志有 6000 余行，设备行出现在第 76 行，`TailLines=1000` 的窗口取不到。改为从 `pod.CreationTimestamp` 起读（`SinceTime`），保留 `LimitBytes` 防止单行过大。
+
+### 6.3 vLLM 侧集群验证（2026-10-29）
+
+在单节点 K3s（同上环境）用 `Qwen/Qwen3.5-2B`（safetensors，4.55 GB）验证 vLLM 后端：
+
+- 镜像：`swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/vllm/vllm-openai:v0.32.0`，Pod 内 `/v1/models`、`/health`、`/metrics` 正常；`/health` 由 startup/readiness 探针覆盖，Ready 用时约 2 分 57 秒。
+- `GPUOffload=Unknown/NotDetected`：符合设计（该条件只对 llama.cpp 生效）。
+- 权重下载走 operator 注入的 safetensors 脚本，第二次 Pod 起时 `Cache hit`，未重复下载。
+- 期间发现两个问题并修复：默认镜像 `-cu129` 变体启动即崩（改默认 tag 为 `v0.32.0`）；下载器镜像原先硬编码 vLLM 镜像，改为跟随 `spec.image`，并加 `HF_HUB_DISABLE_XET=1` 规避 Xet 影子域名 401。
+- 前缀缓存 hits 恒为 0 的现象已记入 M3 节结论第 6 条，不作为本版验收阻塞项。
 
 ## 7. 边界问题清单
 
@@ -682,4 +722,4 @@ M1、M2 的「集群验收」步骤本次未执行（用户要求暂不上集群
 - 本文中的耗时均为估算，不是承诺。
 - `-lv 4` 能否在保留检测行的同时把启动日志从约 4300 行降下来（未测；非必需优化，M2-T4 用已实测的 5）。
 - apiserver 对「内容无变化的 Update」是否跳过写入与 resourceVersion 递增（F9 的推断部分；可用 M1-T5 的 resourceVersion 稳定性用例间接验证）。
-- vLLM v0.32.0 的 cu129 构建是否包含 Blackwell（sm_120）CUDA 内核（M3-T0 第一个验证点）。
+- vLLM v0.32.0（CUDA 13）构建是否包含 Blackwell（sm_120）CUDA 内核（M3-T0 第一个验证点）。

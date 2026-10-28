@@ -5,6 +5,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
+
+	appsv1 "k8s.io/api/apps/v1"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,6 +23,9 @@ import (
 const (
 	testCUDADevice      = "CUDA0"
 	testPodName         = "qwen-0"
+	testPodUID          = "pod-uid"
+	testCUDADeviceLine  = "llama_prepare_model_devices: using device CUDA0"
+	testCPUDeviceLine   = "llama_prepare_model_devices: using device CPU"
 	testCPUFallbackCase = "cpu fallback"
 )
 
@@ -93,7 +99,7 @@ func TestGPULogStatus(t *testing.T) {
 			name: "offload detected",
 			observation: gpuObservation{
 				device: testCUDADevice,
-				line:   "llama_prepare_model_devices: using device CUDA0",
+				line:   testCUDADeviceLine,
 				found:  true,
 			},
 			wantStatus:  metav1.ConditionTrue,
@@ -104,7 +110,7 @@ func TestGPULogStatus(t *testing.T) {
 			name: testCPUFallbackCase,
 			observation: gpuObservation{
 				device: gpuDeviceCPU,
-				line:   "llama_prepare_model_devices: using device CPU",
+				line:   testCPUDeviceLine,
 				found:  true,
 			},
 			wantStatus:  metav1.ConditionFalse,
@@ -155,7 +161,7 @@ func TestObserveGPULoad(t *testing.T) {
 				Name:      testPodName,
 				Namespace: testNamespace,
 				UID:       uid,
-				Labels:    labelsFor(testModel(llmv1alpha1.ModelSpec{})),
+				Labels:    labelsFor(gpuTestModel(llmv1alpha1.ModelSpec{})),
 			},
 			Status: corev1.PodStatus{Phase: corev1.PodRunning},
 		}
@@ -173,7 +179,7 @@ func TestObserveGPULoad(t *testing.T) {
 			},
 		}
 
-		observation, err := reconciler.observeGPULoad(context.Background(), testModel(llmv1alpha1.ModelSpec{}))
+		observation, err := reconciler.observeGPULoad(context.Background(), gpuTestModel(llmv1alpha1.ModelSpec{}))
 		if err != nil {
 			t.Fatalf("observeGPULoad() error = %v", err)
 		}
@@ -191,7 +197,7 @@ func TestObserveGPULoad(t *testing.T) {
 				return cudaLog, nil
 			},
 		}
-		model := testModel(llmv1alpha1.ModelSpec{GPU: &llmv1alpha1.GPUSpec{Count: 1, Layers: 99}})
+		model := gpuTestModel(llmv1alpha1.ModelSpec{GPU: &llmv1alpha1.GPUSpec{Count: 1, Layers: 99}})
 
 		for range 3 {
 			observation, err := reconciler.observeGPULoad(context.Background(), model)
@@ -216,7 +222,7 @@ func TestObserveGPULoad(t *testing.T) {
 				return cpuLog, nil
 			},
 		}
-		model := testModel(llmv1alpha1.ModelSpec{GPU: &llmv1alpha1.GPUSpec{Count: 1, Layers: 99}})
+		model := gpuTestModel(llmv1alpha1.ModelSpec{GPU: &llmv1alpha1.GPUSpec{Count: 1, Layers: 99}})
 
 		if _, err := reconciler.observeGPULoad(context.Background(), model); err != nil {
 			t.Fatalf("observeGPULoad() error = %v", err)
@@ -251,16 +257,17 @@ func TestObserveGPULoad(t *testing.T) {
 			},
 		}
 
-		if _, err := reconciler.observeGPULoad(context.Background(), testModel(llmv1alpha1.ModelSpec{})); err == nil {
+		if _, err := reconciler.observeGPULoad(context.Background(), gpuTestModel(llmv1alpha1.ModelSpec{})); err == nil {
 			t.Fatal("observeGPULoad() error = nil, want the log read failure")
 		}
 	})
 }
 
 func TestGPUConditions(t *testing.T) {
-	cudaLog := "llama_prepare_model_devices: using device CUDA0"
-	cpuLog := "llama_prepare_model_devices: using device CPU"
+	cudaLog := testCUDADeviceLine
+	cpuLog := testCPUDeviceLine
 	ready := rolloutState{phase: phaseReady}
+	zero := int32(0)
 
 	tests := []struct {
 		name       string
@@ -300,6 +307,13 @@ func TestGPUConditions(t *testing.T) {
 			wantStatus: metav1.ConditionFalse,
 			wantReason: gpuReasonCPUFallback,
 		},
+		{
+			name:       "scaled to zero",
+			spec:       llmv1alpha1.ModelSpec{GPU: &llmv1alpha1.GPUSpec{Count: 1, Layers: 99}, Replicas: &zero},
+			state:      rolloutState{phase: phaseScaledToZero},
+			wantStatus: metav1.ConditionUnknown,
+			wantReason: gpuReasonNotDetected,
+		},
 	}
 
 	for _, test := range tests {
@@ -313,7 +327,7 @@ func TestGPUConditions(t *testing.T) {
 					Name:      testPodName,
 					Namespace: testNamespace,
 					UID:       "uid-1",
-					Labels:    labelsFor(testModel(llmv1alpha1.ModelSpec{})),
+					Labels:    labelsFor(gpuTestModel(llmv1alpha1.ModelSpec{})),
 				},
 				Status: corev1.PodStatus{Phase: corev1.PodRunning},
 			}
@@ -324,7 +338,7 @@ func TestGPUConditions(t *testing.T) {
 				},
 			}
 
-			conditions := reconciler.gpuConditions(context.Background(), testModel(test.spec), test.state)
+			conditions := reconciler.gpuConditions(context.Background(), gpuTestModel(test.spec), test.state)
 			if test.wantNil {
 				if len(conditions) != 0 {
 					t.Fatalf("conditions = %+v, want none", conditions)
@@ -334,6 +348,9 @@ func TestGPUConditions(t *testing.T) {
 			if len(conditions) != 1 {
 				t.Fatalf("conditions = %+v, want exactly one", conditions)
 			}
+			if conditions[0].ObservedGeneration != 7 {
+				t.Fatalf("ObservedGeneration = %d, want 7", conditions[0].ObservedGeneration)
+			}
 			if conditions[0].Status != test.wantStatus || conditions[0].Reason != test.wantReason {
 				t.Fatalf("condition = %s/%s, want %s/%s",
 					conditions[0].Status, conditions[0].Reason, test.wantStatus, test.wantReason)
@@ -342,8 +359,41 @@ func TestGPUConditions(t *testing.T) {
 	}
 }
 
+func gpuTestModel(spec llmv1alpha1.ModelSpec) *llmv1alpha1.Model {
+	model := testModel(spec)
+	model.UID = "model-uid"
+	model.Generation = 7
+	return model
+}
+
+// Every fake serving Pod belongs to a real Model -> Deployment -> ReplicaSet
+// owner chain, with matching current templates rather than label-only fallback.
 func fakeClientWith(t *testing.T, scheme *runtime.Scheme, objects ...client.Object) client.Client {
 	t.Helper()
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := llmv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	model := gpuTestModel(llmv1alpha1.ModelSpec{})
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: model.Name, Namespace: model.Namespace, UID: "deployment-uid",
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(model, llmv1alpha1.GroupVersion.WithKind("Model"))}},
+		Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: labelsFor(model)}}},
+	}
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{Name: model.Name + "-rs", Namespace: model.Namespace, UID: "rs-uid", Labels: labelsFor(model),
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(deployment, appsv1.SchemeGroupVersion.WithKind("Deployment"))}},
+		Spec: appsv1.ReplicaSetSpec{Template: *deployment.Spec.Template.DeepCopy()},
+	}
+	for _, object := range objects {
+		if pod, ok := object.(*corev1.Pod); ok {
+			pod.Labels = labelsFor(model)
+			pod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(rs, appsv1.SchemeGroupVersion.WithKind("ReplicaSet"))}
+		}
+	}
+	objects = append(objects, model, deployment, rs)
 	return fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 }
 
@@ -367,4 +417,143 @@ func TestInferencePodLog(t *testing.T) {
 			t.Fatal("inferencePodLog() returned an empty log")
 		}
 	})
+}
+
+func TestObserveGPULoadRetriesTransientResults(t *testing.T) {
+	for _, firstFails := range []bool{false, true} {
+		t.Run(map[bool]string{false: "missing line is retryable", true: "read error is retryable"}[firstFails], func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			if err := corev1.AddToScheme(scheme); err != nil {
+				t.Fatal(err)
+			}
+			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: testPodName, Namespace: testNamespace, UID: testPodUID}, Status: corev1.PodStatus{Phase: corev1.PodRunning}}
+			reads := 0
+			r := &ModelReconciler{Client: fakeClientWith(t, scheme, pod), readPodLog: func(context.Context, *corev1.Pod) (string, error) {
+				reads++
+				if reads == 1 {
+					if firstFails {
+						return "", errors.New("temporary error")
+					}
+					return "loading model", nil
+				}
+				return testCUDADeviceLine, nil
+			}}
+			model := gpuTestModel(llmv1alpha1.ModelSpec{})
+			first, err := r.observeGPULoad(context.Background(), model)
+			if first.found || (err != nil) != firstFails {
+				t.Fatalf("first = %+v, err = %v", first, err)
+			}
+			if len(r.gpuScans) != 0 {
+				t.Fatal("transient observation must not be cached")
+			}
+			for range 2 {
+				observation, err := r.observeGPULoad(context.Background(), model)
+				if err != nil || !observation.found || observation.device != testCUDADevice {
+					t.Fatalf("retry = %+v, err = %v", observation, err)
+				}
+			}
+			if reads != 2 {
+				t.Fatalf("reads = %d, want 2", reads)
+			}
+		})
+	}
+}
+
+func TestObserveGPULoadRescansRestartedContainer(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: testPodName, Namespace: testNamespace, UID: testPodUID}, Status: corev1.PodStatus{Phase: corev1.PodRunning,
+		ContainerStatuses: []corev1.ContainerStatus{{Name: inferenceContainerName, RestartCount: 0}}}}
+	reads := 0
+	r := &ModelReconciler{Client: fakeClientWith(t, scheme, pod), readPodLog: func(context.Context, *corev1.Pod) (string, error) {
+		reads++
+		switch reads {
+		case 1:
+			return testCUDADeviceLine, nil
+		case 2:
+			return "", errors.New("log not ready after restart")
+		default:
+			return testCPUDeviceLine, nil
+		}
+	}}
+	model := gpuTestModel(llmv1alpha1.ModelSpec{})
+	if got, err := r.observeGPULoad(context.Background(), model); err != nil || got.device != testCUDADevice {
+		t.Fatalf("first = %+v, %v", got, err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(pod), pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.Status.ContainerStatuses[0].RestartCount = 1
+	if err := r.Status().Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.observeGPULoad(context.Background(), model); err == nil {
+		t.Fatal("want restart log read error")
+	}
+	cached := r.gpuScans[client.ObjectKeyFromObject(model)]
+	if cached.restartCount != 0 || cached.observation.device != testCUDADevice {
+		t.Fatalf("read error replaced previous good cache: %+v", cached)
+	}
+	for range 2 {
+		if got, err := r.observeGPULoad(context.Background(), model); err != nil || got.device != gpuDeviceCPU {
+			t.Fatalf("after restart = %+v, %v", got, err)
+		}
+	}
+	if reads != 3 {
+		t.Fatalf("reads = %d, want 3", reads)
+	}
+}
+
+func TestGPUConditionsUnsupportedRuntimeDoesNotReadLog(t *testing.T) {
+	for _, state := range []rolloutState{{phase: phaseReady}, {phase: phaseDeploying}} {
+		for _, spec := range []llmv1alpha1.ModelSpec{
+			{Runtime: runtimeVLLM, GPU: &llmv1alpha1.GPUSpec{Count: 1}},
+			{Source: "hf://org/model", GPU: &llmv1alpha1.GPUSpec{Count: 1}},
+		} {
+			model := gpuTestModel(spec)
+			model.Status.ResolvedRuntime = runtimeLlamaCpp // stale status cannot select the parser.
+			r := &ModelReconciler{readPodLog: func(context.Context, *corev1.Pod) (string, error) {
+				t.Fatal("unsupported runtime read logs")
+				return "", nil
+			}}
+			conditions := r.gpuConditions(context.Background(), model, state)
+			if len(conditions) != 1 || conditions[0].Status != metav1.ConditionUnknown || conditions[0].Reason != gpuReasonNotDetected || conditions[0].ObservedGeneration != model.Generation || !strings.Contains(conditions[0].Message, "not supported") {
+				t.Fatalf("unsupported runtime conditions = %+v", conditions)
+			}
+		}
+	}
+}
+
+func TestGPUConditionsMessageLimits(t *testing.T) {
+	for _, logErr := range []bool{false, true} {
+		scheme := runtime.NewScheme()
+		if err := corev1.AddToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: testPodName, Namespace: testNamespace, UID: testPodUID}, Status: corev1.PodStatus{Phase: corev1.PodRunning}}
+		r := &ModelReconciler{Client: fakeClientWith(t, scheme, pod), readPodLog: func(context.Context, *corev1.Pod) (string, error) {
+			if logErr {
+				return "", errors.New(strings.Repeat("错误", 400))
+			}
+			return "llama_prepare_model_devices: using device CUDA0 " + strings.Repeat("显卡", 400), nil
+		}}
+		model := gpuTestModel(llmv1alpha1.ModelSpec{GPU: &llmv1alpha1.GPUSpec{Count: 1}})
+		model.Status.ResolvedRuntime = runtimeVLLM // the current spec resolves llama.cpp.
+		conditions := r.gpuConditions(context.Background(), model, rolloutState{phase: phaseReady})
+		if len(conditions) != 1 {
+			t.Fatalf("conditions = %+v", conditions)
+		}
+		condition := conditions[0]
+		if condition.ObservedGeneration != model.Generation || len(condition.Message) > diagnosisMessageLimit || !utf8.ValidString(condition.Message) || !strings.HasSuffix(condition.Message, "...") {
+			t.Fatalf("invalid condition: %+v", condition)
+		}
+		if logErr && condition.Status != metav1.ConditionUnknown {
+			t.Fatalf("log error status = %s", condition.Status)
+		}
+		if !logErr && condition.Status != metav1.ConditionTrue {
+			t.Fatalf("log status = %s", condition.Status)
+		}
+	}
 }

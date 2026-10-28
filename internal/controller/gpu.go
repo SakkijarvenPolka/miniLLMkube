@@ -7,6 +7,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -22,11 +23,14 @@ const (
 	// Requesting a GPU is a request; this condition is the observation.
 	gpuOffloadConditionType = "GPUOffload"
 
-	gpuLogTailLines  = int64(1000)
 	gpuLogLimitBytes = int64(512 * 1024)
 
 	gpuDeviceCUDA = "CUDA"
 	gpuDeviceCPU  = "CPU"
+
+	// scaledToZeroGPUOffloadMessage replaces the device-line verdict while no
+	// inference Pod exists.
+	scaledToZeroGPUOffloadMessage = "Scaled to zero: there is no inference Pod to inspect"
 
 	gpuReasonDetected    = "OffloadDetected"
 	gpuReasonCPUFallback = "CPUFallback"
@@ -46,11 +50,12 @@ type gpuObservation struct {
 }
 
 // gpuScan remembers the log read done for one Pod, so a reconcile loop does not
-// re-read a Pod log it already parsed. A replaced Pod has a new UID and is read
-// again.
+// re-read a Pod log with a known device. A replacement Pod or a container
+// restart causes another scan; missing device lines remain retryable.
 type gpuScan struct {
-	podUID      types.UID
-	observation gpuObservation
+	podUID       types.UID
+	restartCount int32
+	observation  gpuObservation
 }
 
 // parseGPUDevice extracts the device llama.cpp reports having prepared.
@@ -90,21 +95,21 @@ func gpuLogStatus(observation gpuObservation) metav1.Condition {
 			Type:    gpuOffloadConditionType,
 			Status:  metav1.ConditionUnknown,
 			Reason:  gpuReasonNotDetected,
-			Message: "The inference log has no device line yet",
+			Message: truncateDiagnosisMessage("The inference log has no device line yet"),
 		}
 	case strings.HasPrefix(observation.device, gpuDeviceCUDA):
 		return metav1.Condition{
 			Type:    gpuOffloadConditionType,
 			Status:  metav1.ConditionTrue,
 			Reason:  gpuReasonDetected,
-			Message: fmt.Sprintf("Running on %s: %s", observation.device, observation.line),
+			Message: truncateDiagnosisMessage(fmt.Sprintf("Running on %s: %s", observation.device, observation.line)),
 		}
 	default:
 		return metav1.Condition{
 			Type:    gpuOffloadConditionType,
 			Status:  metav1.ConditionFalse,
 			Reason:  gpuReasonCPUFallback,
-			Message: fmt.Sprintf("llama.cpp fell back to the CPU: %s", observation.line),
+			Message: truncateDiagnosisMessage(fmt.Sprintf("llama.cpp fell back to the CPU: %s", observation.line)),
 		}
 	}
 }
@@ -115,44 +120,39 @@ func (r *ModelReconciler) runningInferencePod(
 	ctx context.Context,
 	model *llmv1alpha1.Model,
 ) (*corev1.Pod, error) {
-	pods := &corev1.PodList{}
-	err := r.List(ctx, pods,
-		client.InNamespace(model.Namespace),
-		client.MatchingLabels(labelsFor(model)),
-	)
+	pods, err := r.currentInferencePods(ctx, model)
 	if err != nil {
-		return nil, fmt.Errorf("list inference pods: %w", err)
+		return nil, err
 	}
-
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		if pod.Status.Phase != corev1.PodRunning || pod.DeletionTimestamp != nil {
-			continue
+	for i := range pods {
+		if pods[i].Status.Phase == corev1.PodRunning && pods[i].DeletionTimestamp == nil {
+			return &pods[i], nil
 		}
-		return pod, nil
 	}
 	return nil, nil
 }
 
-// inferencePodLog reads the tail of the inference container log.
+// inferencePodLog reads the inference container log from the start of the Pod.
 //
-// The read is bounded twice: TailLines keeps a long-running server from
-// streaming its whole history, LimitBytes caps the bytes the API server sends.
-// The device line is printed at startup, so the tail is only a concern for a Pod
-// that has been serving for a very long time -- that case is covered by caching
-// the observation per Pod instead of re-reading.
+// The device line is printed while the model loads, at the very beginning of
+// the log, so a tail window would drift past it as soon as a busy server logs
+// more than the window. Reading from the start with a byte cap keeps the read
+// bounded while still covering the startup lines.
 func (r *ModelReconciler) inferencePodLog(ctx context.Context, pod *corev1.Pod) (string, error) {
 	if r.Clientset == nil {
 		return "", errors.New("pod log client is not configured")
 	}
 
-	tailLines := gpuLogTailLines
 	limitBytes := gpuLogLimitBytes
-	stream, err := r.Clientset.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+	opts := &corev1.PodLogOptions{
 		Container:  inferenceContainerName,
-		TailLines:  &tailLines,
 		LimitBytes: &limitBytes,
-	}).Stream(ctx)
+	}
+	if !pod.CreationTimestamp.IsZero() {
+		sinceSeconds := max(0, int64(time.Since(pod.CreationTimestamp.Time).Seconds()))
+		opts.SinceSeconds = &sinceSeconds
+	}
+	stream, err := r.Clientset.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, opts).Stream(ctx)
 	if err != nil {
 		return "", fmt.Errorf("open log stream for pod %s: %w", pod.Name, err)
 	}
@@ -174,6 +174,14 @@ func (r *ModelReconciler) readInferenceLog(ctx context.Context, pod *corev1.Pod)
 	return r.inferencePodLog(ctx, pod)
 }
 
+func inferenceRestartCount(pod *corev1.Pod) int32 {
+	status, ok := containerStatus(pod, inferenceContainerName)
+	if !ok {
+		return 0
+	}
+	return status.RestartCount
+}
+
 // observeGPULoad reads the inference log of the running Pod once and remembers
 // what it saw. A Model without a running Pod yields an empty observation: there
 // is nothing to read yet, which is not an error.
@@ -193,7 +201,8 @@ func (r *ModelReconciler) observeGPULoad(
 	r.gpuMu.Lock()
 	cached, seen := r.gpuScans[key]
 	r.gpuMu.Unlock()
-	if seen && cached.podUID == pod.UID {
+	restartCount := inferenceRestartCount(pod)
+	if seen && cached.podUID == pod.UID && cached.restartCount == restartCount && cached.observation.found {
 		return cached.observation, nil
 	}
 
@@ -205,12 +214,17 @@ func (r *ModelReconciler) observeGPULoad(
 	observation := gpuObservation{line: gpuDeviceLine(logText)}
 	observation.device, observation.found = parseGPUDevice(logText)
 
-	r.gpuMu.Lock()
-	if r.gpuScans == nil {
-		r.gpuScans = make(map[types.NamespacedName]gpuScan)
+	// Do not cache a successful read with no device line: a later reconcile may
+	// observe the line after startup. On read failure, return before this block,
+	// preserving any previous good cache entry.
+	if observation.found {
+		r.gpuMu.Lock()
+		if r.gpuScans == nil {
+			r.gpuScans = make(map[types.NamespacedName]gpuScan)
+		}
+		r.gpuScans[key] = gpuScan{podUID: pod.UID, restartCount: restartCount, observation: observation}
+		r.gpuMu.Unlock()
 	}
-	r.gpuScans[key] = gpuScan{podUID: pod.UID, observation: observation}
-	r.gpuMu.Unlock()
 
 	return observation, nil
 }
@@ -226,16 +240,39 @@ func (r *ModelReconciler) gpuConditions(
 		return nil
 	}
 
+	// Nothing runs at replicas 0, so the log-based verdict is reset instead of
+	// keeping the offload state of a Pod that no longer exists.
+	if replicasFor(model) == 0 {
+		return []metav1.Condition{{
+			Type:               gpuOffloadConditionType,
+			Status:             metav1.ConditionUnknown,
+			Reason:             gpuReasonNotDetected,
+			ObservedGeneration: model.Generation,
+			Message:            truncateDiagnosisMessage(scaledToZeroGPUOffloadMessage),
+		}}
+	}
+
 	condition := metav1.Condition{
 		Type:               gpuOffloadConditionType,
 		ObservedGeneration: model.Generation,
+	}
+	backend, _, backendErr := resolveBackend(model)
+	if backendErr != nil || backend.Name() != runtimeLlamaCpp {
+		condition.Status = metav1.ConditionUnknown
+		condition.Reason = gpuReasonNotDetected
+		condition.Message = "GPU offload detection is not supported for this runtime"
+		if backendErr != nil {
+			condition.Message = fmt.Sprintf("GPU offload detection is unavailable: %s", backendErr)
+		}
+		condition.Message = truncateDiagnosisMessage(condition.Message)
+		return []metav1.Condition{condition}
 	}
 	if state.phase != phaseReady {
 		// The device line exists only once llama.cpp has loaded the model; a Pod
 		// that has not rolled out yet has nothing to inspect.
 		condition.Status = metav1.ConditionUnknown
 		condition.Reason = gpuReasonNotDetected
-		condition.Message = "Waiting for the inference Pod to become ready"
+		condition.Message = truncateDiagnosisMessage("Waiting for the inference Pod to become ready")
 		return []metav1.Condition{condition}
 	}
 
@@ -249,9 +286,11 @@ func (r *ModelReconciler) gpuConditions(
 			"name", model.Name)
 		condition.Status = metav1.ConditionUnknown
 		condition.Reason = gpuReasonNotDetected
-		condition.Message = fmt.Sprintf("Could not read the inference log: %s", err.Error())
+		condition.Message = truncateDiagnosisMessage(fmt.Sprintf("Could not read the inference log: %s", err.Error()))
 		return []metav1.Condition{condition}
 	}
 
-	return []metav1.Condition{gpuLogStatus(observation)}
+	result := gpuLogStatus(observation)
+	result.ObservedGeneration = model.Generation
+	return []metav1.Condition{result}
 }

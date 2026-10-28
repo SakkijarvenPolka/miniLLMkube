@@ -20,26 +20,29 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"reflect"
-	"strconv"
-	"strings"
 	"sync"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	llmv1alpha1 "github.com/SakkijarvenPolka/minillmkube/api/v1alpha1"
 )
@@ -54,10 +57,24 @@ const (
 	modelVolumeName  = "model"
 	inferenceAppName = "minillmkube-inference"
 
+	inferenceInstanceLabel  = "app.kubernetes.io/instance"
+	inferenceNameLabel      = "app.kubernetes.io/name"
+	inferenceManagedByLabel = "app.kubernetes.io/managed-by"
+	inferenceManagedBy      = "minillmkube"
+
 	phasePending   = "Pending"
 	phaseDeploying = "Deploying"
 	phaseReady     = "Ready"
 	phaseFailed    = "Failed"
+
+	// phaseScaledToZero marks a Model whose spec.replicas is 0: no Pod serves
+	// the Model, so it is neither ready nor failed.
+	phaseScaledToZero = "ScaledToZero"
+
+	// reasonScaledToZero and reasonScalingDown explain whether the GPU has been
+	// released already or a terminating replica still holds it.
+	reasonScaledToZero = "ScaledToZero"
+	reasonScalingDown  = "ScalingDown"
 )
 
 type rolloutState struct {
@@ -75,6 +92,9 @@ type ModelReconciler struct {
 	// Clientset reads inference Pod logs. The typed client is used because the
 	// controller-runtime client has no log subresource.
 	Clientset kubernetes.Interface
+	// Recorder publishes the failure transitions of a Model; it is nil in tests
+	// that do not care about events.
+	Recorder events.EventRecorder
 	// readPodLog replaces the API server log read; it is nil in production and
 	// set by unit tests that cannot serve logs.
 	readPodLog func(ctx context.Context, pod *corev1.Pod) (string, error)
@@ -87,9 +107,11 @@ type ModelReconciler struct {
 // +kubebuilder:rbac:groups=llm.example.io,resources=models/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=llm.example.io,resources=models/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -150,6 +172,13 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	desiredReplicas := replicasFor(model)
 	state := evaluateRollout(deployment, desiredReplicas)
 	state.endpoint = endpointFor(model)
+	// A Pod that cannot start never becomes ready, so the Deployment keeps
+	// reporting progress forever; the Pod status holds the actual reason.
+	var diagnosisErr error
+	state, diagnosisErr = r.withPodDiagnosis(ctx, model, state)
+	if diagnosisErr != nil {
+		return ctrl.Result{}, diagnosisErr
+	}
 
 	// GPU offload is verified from the inference log, so it is only read once
 	// the rollout is complete; gpuConditions returns nil for CPU-only Models.
@@ -161,14 +190,138 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	return ctrl.Result{}, nil
 }
 
+// withPodDiagnosis replaces the generic rollout state with the Pod-level failure
+// diagnosis when there is one. API errors are returned so the work queue retries
+// rather than permanently hiding a Pod failure behind a generic rollout state.
+func (r *ModelReconciler) withPodDiagnosis(
+	ctx context.Context,
+	model *llmv1alpha1.Model,
+	state rolloutState,
+) (rolloutState, error) {
+	// A scaled-to-zero Model has no serving Pod by design, so there is nothing
+	// to diagnose; a terminating Pod must not turn the idle state into Failed.
+	if state.phase == phaseReady || state.phase == phaseScaledToZero {
+		return state, nil
+	}
+
+	pods, err := r.currentInferencePods(ctx, model)
+	if err != nil {
+		return state, err
+	}
+
+	diagnosis := diagnosePods(pods)
+	if diagnosis == nil {
+		return state, nil
+	}
+
+	state.phase = phaseFailed
+	state.status = metav1.ConditionFalse
+	state.reason = diagnosis.reason
+	state.message = diagnosis.message
+	return state, nil
+}
+
+// currentInferencePods follows the controller owner chain and the desired Pod
+// template, never a mutable label or an old Deployment revision alone. Before
+// the Deployment controller creates the matching ReplicaSet the result is empty.
+func (r *ModelReconciler) currentInferencePods(ctx context.Context, model *llmv1alpha1.Model) ([]corev1.Pod, error) {
+	deployment := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(model), deployment); err != nil {
+		return nil, client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(deployment, model) {
+		return nil, nil
+	}
+	replicaSets := &appsv1.ReplicaSetList{}
+	if err := r.List(ctx, replicaSets, client.InNamespace(model.Namespace), client.MatchingLabels(labelsFor(model))); err != nil {
+		return nil, err
+	}
+	current := make(map[types.UID]bool)
+	for i := range replicaSets.Items {
+		rs := &replicaSets.Items[i]
+		if rs.DeletionTimestamp == nil && metav1.IsControlledBy(rs, deployment) && samePodTemplate(rs.Spec.Template, deployment.Spec.Template) {
+			current[rs.UID] = true
+		}
+	}
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods, client.InNamespace(model.Namespace), client.MatchingLabels(labelsFor(model))); err != nil {
+		return nil, err
+	}
+	result := make([]corev1.Pod, 0, len(pods.Items))
+	for _, pod := range pods.Items {
+		owner := metav1.GetControllerOf(&pod)
+		if pod.DeletionTimestamp == nil && owner != nil && owner.APIVersion == appsv1.SchemeGroupVersion.String() && owner.Kind == "ReplicaSet" && current[owner.UID] {
+			result = append(result, pod)
+		}
+	}
+	return result, nil
+}
+
+func samePodTemplate(a, b corev1.PodTemplateSpec) bool {
+	left, right := a.DeepCopy(), b.DeepCopy()
+	delete(left.Labels, appsv1.DefaultDeploymentUniqueLabelKey)
+	delete(right.Labels, appsv1.DefaultDeploymentUniqueLabelKey)
+	return equality.Semantic.DeepEqual(left, right)
+}
+
+// readyConditionReason returns the Reason currently stored on the Ready
+// condition, or "" when the Model has none yet.
+func readyConditionReason(model *llmv1alpha1.Model) string {
+	if condition := meta.FindStatusCondition(model.Status.Conditions, readyCondition); condition != nil {
+		return condition.Reason
+	}
+	return ""
+}
+
+// recordFailureEvent emits one Warning per failure transition. Emitting on every
+// reconcile would flood a persistently failing Model with events (E30).
+func (r *ModelReconciler) recordFailureEvent(
+	ctx context.Context,
+	model *llmv1alpha1.Model,
+	state rolloutState,
+	previousReason string,
+) {
+	if r.Recorder == nil || state.phase != phaseFailed || state.reason == previousReason {
+		return
+	}
+	r.Recorder.Eventf(model, nil, corev1.EventTypeWarning, state.reason, "ReconcileModel", "%s", state.message)
+	logf.FromContext(ctx).Info("Recorded failure event", "name", model.Name, "reason", state.reason)
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *ModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&llmv1alpha1.Model{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
+		// A failing Pod does not change the Deployment status, so its Model must
+		// be reconciled again when the Pod reports a new failure reason.
+		Watches(&corev1.Pod{},
+			handler.EnqueueRequestsFromMapFunc(r.podToModelRequest),
+			builder.WithPredicates(predicate.NewPredicateFuncs(isInferencePod))).
 		Named("model").
 		Complete(r)
+}
+
+// podToModelRequest maps an inference Pod back to the Model that owns it. The
+// label is the only link available: the Pod is owned by the ReplicaSet, not by
+// the Model.
+func (r *ModelReconciler) podToModelRequest(_ context.Context, object client.Object) []reconcile.Request {
+	name := object.GetLabels()[inferenceInstanceLabel]
+	if name == "" {
+		return nil
+	}
+	return []reconcile.Request{{
+		NamespacedName: types.NamespacedName{Namespace: object.GetNamespace(), Name: name},
+	}}
+}
+
+// isInferencePod filters out every Pod this controller does not own.
+func isInferencePod(object client.Object) bool {
+	labels := object.GetLabels()
+	return labels[inferenceInstanceLabel] != "" &&
+		labels[inferenceNameLabel] == inferenceAppName &&
+		labels[inferenceManagedByLabel] == inferenceManagedBy
 }
 
 func (r *ModelReconciler) reconcileDeployment(
@@ -190,7 +343,10 @@ func (r *ModelReconciler) reconcileDeployment(
 		if wantsGPU(model) {
 			deployment.Spec.Strategy = appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType}
 		} else {
-			deployment.Spec.Strategy = appsv1.DeploymentStrategy{Type: appsv1.RollingUpdateDeploymentStrategyType}
+			deployment.Spec.Strategy = appsv1.DeploymentStrategy{
+				Type:          appsv1.RollingUpdateDeploymentStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDeployment{MaxUnavailable: pointerTo(intstr.FromString("25%")), MaxSurge: pointerTo(intstr.FromString("25%"))},
+			}
 		}
 		deployment.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
 		deployment.Spec.Template.Labels = labels
@@ -233,19 +389,29 @@ func (r *ModelReconciler) updateStatus(
 	extra ...metav1.Condition,
 ) error {
 	before := model.DeepCopy()
+	previousReason := readyConditionReason(before)
 	model.Status.Phase = state.phase
 	if state.endpoint != "" {
 		model.Status.Endpoint = state.endpoint
 	}
 	model.Status.ReadyReplicas = readyReplicas
 	model.Status.CacheKey = cacheKeyFor(model.Spec.Source)
+	// The resolved backend is an observation: "auto" stays in the spec and the
+	// decision is only reported here (E29).
+	if backend, format, err := resolveBackend(model); err == nil {
+		model.Status.ResolvedRuntime = backend.Name()
+		model.Status.ResolvedFormat = format
+	} else {
+		model.Status.ResolvedRuntime = ""
+		model.Status.ResolvedFormat = ""
+	}
 	model.Status.ObservedGeneration = model.Generation
 	meta.SetStatusCondition(&model.Status.Conditions, metav1.Condition{
 		Type:               readyCondition,
 		Status:             state.status,
 		ObservedGeneration: model.Generation,
 		Reason:             state.reason,
-		Message:            state.message,
+		Message:            truncateDiagnosisMessage(state.message),
 	})
 	for _, condition := range extra {
 		meta.SetStatusCondition(&model.Status.Conditions, condition)
@@ -259,24 +425,31 @@ func (r *ModelReconciler) updateStatus(
 	if reflect.DeepEqual(before.Status, model.Status) {
 		return nil
 	}
-	return r.Status().Patch(ctx, model, client.MergeFrom(before))
-}
-
-func validateSpec(model *llmv1alpha1.Model) error {
-	sourceURL, err := url.Parse(model.Spec.Source)
-	if err != nil {
-		return fmt.Errorf("source must be a valid URL: %w", err)
+	if err := r.Status().Patch(ctx, model, client.MergeFrom(before)); err != nil {
+		return err
 	}
-	if sourceURL.Scheme != "https" {
-		return fmt.Errorf("source must use https scheme")
-	}
-	if !strings.HasSuffix(sourceURL.Path, ".gguf") {
-		return fmt.Errorf("source path must end with .gguf")
-	}
+	r.recordFailureEvent(ctx, model, state, previousReason)
 	return nil
 }
 
+// validateSpec resolves the backend first and then checks spec.source against
+// the weights format the backend expects: an https URL ending in .gguf for
+// llama.cpp, an hf://<org>/<repo>[@<revision>] reference for vLLM.
+func validateSpec(model *llmv1alpha1.Model) error {
+	_, format, err := resolveBackend(model)
+	if err != nil {
+		return err
+	}
+	if err := validateSource(model, format); err != nil {
+		return err
+	}
+	return validateRuntimeGPU(model)
+}
+
 func evaluateRollout(deployment *appsv1.Deployment, desiredReplicas int32) rolloutState {
+	if desiredReplicas == 0 {
+		return scaledToZeroState(deployment)
+	}
 	if reason, message, failed := deploymentFailure(deployment); failed {
 		return rolloutState{
 			phase:   phaseFailed,
@@ -309,6 +482,26 @@ func evaluateRollout(deployment *appsv1.Deployment, desiredReplicas int32) rollo
 	}
 }
 
+// scaledToZeroState reports a Model that asked for no replica. Reporting Ready
+// with zero serving Pods would be wrong, and the terminating replica is called
+// out because it is the last thing between the Model and a free GPU.
+func scaledToZeroState(deployment *appsv1.Deployment) rolloutState {
+	if deployment.Status.Replicas > 0 {
+		return rolloutState{
+			phase:   phaseScaledToZero,
+			status:  metav1.ConditionFalse,
+			reason:  reasonScalingDown,
+			message: fmt.Sprintf("Waiting for %d replica(s) to terminate", deployment.Status.Replicas),
+		}
+	}
+	return rolloutState{
+		phase:   phaseScaledToZero,
+		status:  metav1.ConditionFalse,
+		reason:  reasonScaledToZero,
+		message: "replicas is 0, inference is disabled",
+	}
+}
+
 func deploymentFailure(deployment *appsv1.Deployment) (string, string, bool) {
 	for _, condition := range deployment.Status.Conditions {
 		if condition.Type == appsv1.DeploymentProgressing && condition.Status == corev1.ConditionFalse {
@@ -332,9 +525,9 @@ func endpointFor(model *llmv1alpha1.Model) string {
 
 func labelsFor(model *llmv1alpha1.Model) map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/name":       inferenceAppName,
-		"app.kubernetes.io/instance":   model.Name,
-		"app.kubernetes.io/managed-by": "minillmkube",
+		inferenceNameLabel:      inferenceAppName,
+		inferenceInstanceLabel:  model.Name,
+		inferenceManagedByLabel: inferenceManagedBy,
 	}
 }
 
@@ -370,29 +563,6 @@ func contextSizeFor(model *llmv1alpha1.Model) int32 {
 		return defaultContext
 	}
 	return model.Spec.ContextSize
-}
-
-// serverArgs renders the llama-server command line. Arguments the operator
-// generates are skipped when the user already set them through spec.extraArgs,
-// and the user's arguments always come last so they win on conflicts.
-func serverArgs(model *llmv1alpha1.Model) []string {
-	args := []string{
-		"--model", modelFilePathFor(model),
-		"--host", "0.0.0.0",
-		"--port", strconv.Itoa(inferencePort),
-		"--ctx-size", strconv.FormatInt(int64(contextSizeFor(model)), 10),
-	}
-	if wantsGPU(model) {
-		if !hasFlag(model.Spec.ExtraArgs, "--n-gpu-layers", "--gpu-layers", "-ngl") {
-			args = append(args, "--n-gpu-layers", strconv.Itoa(int(gpuLayersFor(model))))
-		}
-		// -lv 5 raises the log level so llama.cpp prints the device it loads
-		// the model onto; the GPUOffload condition is parsed from that line.
-		if !hasFlag(model.Spec.ExtraArgs, "--verbosity", "-v", "-lv") {
-			args = append(args, "-lv", gpuVerbosityLevel)
-		}
-	}
-	return append(args, model.Spec.ExtraArgs...)
 }
 
 // usesHostPathCache reports whether the operator was configured with a host

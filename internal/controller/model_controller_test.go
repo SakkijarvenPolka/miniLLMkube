@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -277,6 +278,63 @@ var _ = Describe("Model Controller", func() {
 			Expect(model.Status.Phase).To(Equal("Ready"))
 		})
 
+		It("reports a scaled-to-zero Model instead of claiming readiness", func() {
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			zero := int32(0)
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			model.Spec.Replicas = &zero
+			Expect(k8sClient.Update(ctx, model)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			Expect(deployment.Spec.Replicas).To(HaveValue(Equal(int32(0))))
+
+			By("waiting for the terminating replica while the Deployment still runs one")
+			deployment.Status.ObservedGeneration = deployment.Generation
+			deployment.Status.Replicas = 1
+			deployment.Status.UpdatedReplicas = 0
+			Expect(k8sClient.Status().Update(ctx, deployment)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal("ScaledToZero"))
+			Expect(meta.IsStatusConditionFalse(model.Status.Conditions, "Ready")).To(BeTrue())
+			Expect(model.Status.Conditions).To(ContainElement(WithTransform(func(condition metav1.Condition) string {
+				return condition.Reason
+			}, Equal("ScalingDown"))))
+
+			By("reporting an idle Model once every replica is gone")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			deployment.Status.Replicas = 0
+			deployment.Status.UpdatedReplicas = 0
+			deployment.Status.AvailableReplicas = 0
+			deployment.Status.ReadyReplicas = 0
+			Expect(k8sClient.Status().Update(ctx, deployment)).To(Succeed())
+
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal("ScaledToZero"))
+			Expect(model.Status.ReadyReplicas).To(BeZero())
+			Expect(model.Status.Conditions).To(ContainElement(WithTransform(func(condition metav1.Condition) string {
+				return condition.Reason
+			}, Equal("ScaledToZero"))))
+		})
+
 		It("marks a deployment progress deadline as Failed", func() {
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
@@ -382,7 +440,7 @@ var _ = Describe("Model Controller", func() {
 
 			By("touching the Model without changing anything the Deployment depends on")
 			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
-			model.Annotations = map[string]string{"f9-regression": "true"}
+			model.Annotations = map[string]string{"f9-regression": testTrueValue}
 			Expect(k8sClient.Update(ctx, model)).To(Succeed())
 
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -453,6 +511,189 @@ var _ = Describe("Model Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
 			Expect(deployment.ResourceVersion).To(Equal(resourceVersion))
+		})
+
+		It("rejects vllm with gguf weights before storing the object", func() {
+			invalid := &llmv1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: "invalid-runtime", Namespace: typeNamespacedName.Namespace},
+				Spec: llmv1alpha1.ModelSpec{
+					Source:  modelSource,
+					Runtime: runtimeVLLM,
+					Format:  formatGGUF,
+				},
+			}
+			Expect(k8sClient.Create(ctx, invalid)).To(MatchError(ContainSubstring("vllm does not support gguf")))
+		})
+
+		It("resolves the runtime from the source and reports it in status", func() {
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(model.Status.ResolvedRuntime).To(Equal(runtimeLlamaCpp))
+			Expect(model.Status.ResolvedFormat).To(Equal(formatGGUF))
+		})
+
+		It("runs vllm for an hf:// source", func() {
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			model.Spec.Source = testHFSource
+			model.Spec.Image = ""
+			model.Spec.GPU = &llmv1alpha1.GPUSpec{Count: 1, Layers: 99}
+			Expect(k8sClient.Update(ctx, model)).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(model.Status.ResolvedRuntime).To(Equal(runtimeVLLM))
+			Expect(model.Status.ResolvedFormat).To(Equal(formatSafetensors))
+
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			podSpec := deployment.Spec.Template.Spec
+
+			Expect(podSpec.Containers[0].Image).To(Equal(vllmImage))
+			Expect(podSpec.Containers[0].Args).To(ContainElements(
+				"--served-model-name", resourceName, "--max-model-len", "4096",
+			))
+			Expect(podSpec.Containers[0].StartupProbe.FailureThreshold).To(Equal(vllmStartupFailureThreshold))
+			Expect(podSpec.EnableServiceLinks).To(HaveValue(BeFalse()))
+
+			By("giving vLLM a memory-backed /dev/shm instead of the 64MiB default")
+			var shm *corev1.Volume
+			for i := range podSpec.Volumes {
+				if podSpec.Volumes[i].Name == sharedMemoryVolumeName {
+					shm = &podSpec.Volumes[i]
+				}
+			}
+			Expect(shm).NotTo(BeNil())
+			Expect(shm.EmptyDir.Medium).To(Equal(corev1.StorageMediumMemory))
+			// 1Gi request, no limit: the fallback size applies.
+			Expect(shm.EmptyDir.SizeLimit.String()).To(Equal(defaultSharedMemorySize))
+
+			By("downloading the repository with the same image")
+			downloader := podSpec.InitContainers[0]
+			Expect(downloader.Image).To(Equal(vllmImage))
+			Expect(downloader.Args[0]).To(Equal(downloadScriptSafetensors))
+			Expect(downloader.Env).To(ContainElement(corev1.EnvVar{Name: "MODEL_REPO", Value: "Qwen/Qwen3-0.6B"}))
+		})
+
+		It("reports the Pod failure that keeps the rollout incomplete", func() {
+			recorder := events.NewFakeRecorder(16)
+			controllerReconciler.Recorder = recorder
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("creating the current ReplicaSet and Pod the kubelet would report after a failed download")
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			rs := &appsv1.ReplicaSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName + "-diagnosed-rs",
+					Namespace: testNamespace,
+					Labels:    labelsFor(model),
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(
+						deployment, appsv1.SchemeGroupVersion.WithKind("Deployment"),
+					)},
+				},
+				Spec: appsv1.ReplicaSetSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: labelsFor(model)},
+					Template: *deployment.Spec.Template.DeepCopy(),
+				},
+			}
+			Expect(k8sClient.Create(ctx, rs)).To(Succeed())
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      resourceName + "-diagnosed",
+					Namespace: testNamespace,
+					Labels:    labelsFor(model),
+					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(
+						rs, appsv1.SchemeGroupVersion.WithKind("ReplicaSet"),
+					)},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{
+					Name:  inferenceContainerName,
+					Image: modelImage,
+				}}},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			pod.Status.Phase = corev1.PodPending
+			pod.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+				Name: downloaderContainerName,
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 22,
+					Message:  "GET returned 404 Not Found",
+				}},
+			}}
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+			By("reconciling again now that the Pod explains the stall")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal(phaseFailed))
+
+			ready := meta.FindStatusCondition(model.Status.Conditions, readyCondition)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(reasonDownloadFailed))
+			Expect(ready.Message).To(ContainSubstring("404"))
+
+			By("emitting a warning for the transition")
+			Expect(recorder.Events).To(Receive(ContainSubstring(reasonDownloadFailed)))
+
+			Expect(k8sClient.Delete(ctx, pod)).To(Succeed())
+		})
+
+		It("passes placement and scheduler fields through to the Pod", func() {
+			Expect(k8sClient.Get(ctx, typeNamespacedName, model)).To(Succeed())
+			model.Spec.NodeSelector = map[string]string{testNodeArch: testArchAMD64}
+			model.Spec.Tolerations = []corev1.Toleration{{
+				Key:      gpuResourceName,
+				Operator: corev1.TolerationOpExists,
+				Effect:   corev1.TaintEffectNoSchedule,
+			}}
+			model.Spec.Affinity = &corev1.Affinity{
+				NodeAffinity: &corev1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+						NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+							MatchExpressions: []corev1.NodeSelectorRequirement{{
+								Key:      testNodeArch,
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   []string{testArchAMD64},
+							}},
+						}},
+					},
+				},
+			}
+			model.Spec.SchedulerName = testScheduler
+			Expect(k8sClient.Update(ctx, model)).To(Succeed())
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			podSpec := deployment.Spec.Template.Spec
+
+			Expect(podSpec.SchedulerName).To(Equal(testScheduler))
+			Expect(podSpec.NodeSelector).To(HaveKeyWithValue(testNodeArch, testArchAMD64))
+			Expect(podSpec.Tolerations).To(HaveLen(1))
+			Expect(podSpec.Tolerations[0].Key).To(Equal(gpuResourceName))
+			Expect(podSpec.Affinity).NotTo(BeNil())
+			Expect(podSpec.Affinity.NodeAffinity).NotTo(BeNil())
 		})
 	})
 })

@@ -1,9 +1,8 @@
 # miniLLMkube
 
-miniLLMkube 是一个用 Kubebuilder 编写的 Kubernetes Operator，用来声明式部署 GGUF 格式的大模型推理服务。
+miniLLMkube 是一个用 Kubebuilder 编写的 Kubernetes Operator，用来声明式部署大模型推理服务。
 
-你只需要写一份 `Model` YAML，告诉 Kubernetes 模型文件在哪里、要几个副本、上下文长度是多少。Operator 会自动创建 `Deployment` 和 `Service`，下载模型权重，启动 `llama.cpp` server，并暴露 OpenAI 兼容接口。
-
+你只需要写一份 `Model` YAML，告诉 Kubernetes 模型在哪里、要几个副本、上下文多长。Operator 负责创建 `Deployment` 和 `Service`、下载并缓存权重、启动 `llama.cpp` 或 vLLM，暴露 OpenAI 兼容接口。
 
 ## 它解决什么问题
 
@@ -20,18 +19,12 @@ miniLLMkube 把这些动作收进一个自定义资源里。用户只关心模�
 
 ## 核心能力
 
-- 使用 `Model` CRD 声明一个 GGUF 模型推理服务。
-- 校验 `spec.source`：必须是 HTTPS URL，路径以 `.gguf` 结尾。
-- 通过 initContainer 下载模型，使用 `curlimages/curl:8.11.1`。
-- 每个 `source` 有自己的缓存目录 `/models/<cacheKey>/<文件名>`：`cacheKey` 取 `source` 的 sha256 前 12 位，换模型不会互相覆盖，`status.cacheKey` 会把它暴露出来。
-- 下载时先写 `<文件名>.tmp`，校验通过后再改名，避免半成品模型被主容器读取。
-- 同一缓存目录用 `flock` 串行化：多个副本同时启动时只有一个 Pod 真正下载，其余 Pod 等锁后直接命中。
-- 支持断点续传：已有 `.tmp` 时先 `HEAD` 比对 `Content-Length`，再 `curl -C -` 续传；`EXPECT_FORMAT=gguf` 时会校验 `GGUF` 魔数。
-- 主容器运行 `llama.cpp` server，并提供 OpenAI 兼容 API。
-- 支持 GPU 推理：`spec.gpu` 会请求 `nvidia.com/gpu`、改用 CUDA 镜像、追加 `--n-gpu-layers`，并从推理日志里确认 GPU 是否真的生效。
-- 创建 ClusterIP Service，集群内访问地址会写入 `status.endpoint`。
-- 根据 Deployment 状态维护 `Pending`、`Deploying`、`Ready`、`Failed` 阶段。
-- 支持通过 `MODEL_CACHE_HOST_PATH` 在开发环境复用宿主机上的模型缓存。
+- **双后端、单 CRD**：支持 `llama.cpp`（GGUF）和 vLLM（safetensors）。`spec.runtime` / `spec.format` 默认 `auto`，能从 `source` 推断的不用手写；`vllm + gguf` 这类非法组合在 CEL 层直接拒绝。
+- **下载与缓存隔离**：模型由 initContainer 下载到 `/models/<cacheKey>/`，每个 `source` 独立目录；`flock` 让多副本只有一个真正下载，`.tmp` 加断点续传，GGUF 校验魔数、safetensors 校验配置与全部分片，通过后才算缓存命中。
+- **GPU 推理**：`spec.gpu` 请求 `nvidia.com/gpu`、自动切换 CUDA 镜像、追加 `--n-gpu-layers`，并从推理日志确认 GPU 是否真的生效（`GPUOffload` 条件）。
+- **状态与诊断**：维护 `Pending` / `Deploying` / `Ready` / `Failed`；Pod 卡住时给出 `DownloadFailed`、`FormatMismatch`、`ImagePullFailed`、`InsufficientGPU`、`Unschedulable`、`RuntimeCrashing` 中的具体原因，原因变化时发 Warning 事件。
+- **服务暴露**：创建 ClusterIP Service，集群内访问地址写入 `status.endpoint`，接口兼容 OpenAI。
+- **放置与缓存复用**：`nodeSelector` / `tolerations` / `affinity` / `schedulerName` 原样透传；`MODEL_CACHE_HOST_PATH` 可让开发环境复用宿主机缓存。
 
 ## 架构简图
 
@@ -39,245 +32,105 @@ miniLLMkube 把这些动作收进一个自定义资源里。用户只关心模�
 Model YAML
    |
    v
-Model Controller
+Model Controller（resolveBackend 决定 llama.cpp 或 vLLM）
    |
    +--> Deployment
-   |      |
-   |      +--> initContainer: 下载 GGUF 到 /models/<cacheKey>/<文件名>
-   |      +--> llama.cpp server: 加载同一路径
+   |      +--> initContainer：下载到 /models/<cacheKey>/
+   |      +--> 推理容器：llama.cpp server 或 vLLM（vLLM 额外挂 /dev/shm）
    |
-   +--> Service: 暴露 8080 端口
+   +--> Service：暴露 8080
    |
-   +--> Model Status: phase / endpoint / readyReplicas / conditions
+   +--> Model Status：phase / endpoint / resolvedRuntime / conditions
 ```
 
-## Model 示例
+## 选哪个后端
 
-示例文件在 `config/samples/llm_v1alpha1_model.yaml`：
+| | llama.cpp | vLLM |
+|---|---|---|
+| 模型格式 | GGUF | safetensors（`hf://`） |
+| 默认镜像 | `ghcr.io/ggml-org/llama.cpp:server` / `:server-cuda` | `vllm/vllm-openai:v0.32.0` |
+| 镜像压缩体积 | 0.31 GB / 2.60 GB | 9.21 GB |
+| 适合 | 单机小模型、CPU 也能跑、启动快 | 大模型、高吞吐、continuous batching |
+| 状态 | 已在单节点集群上跑通 | 代码完成，集群验收未执行 |
 
-```yaml
-apiVersion: llm.example.io/v1alpha1
-kind: Model
-metadata:
-  name: qwen3-0-6b
-spec:
-  source: https://hf-mirror.com/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf
-  replicas: 1
-  contextSize: 4096
-  resources:
-    requests:
-      cpu: "1"
-      memory: "2Gi"
-    limits:
-      memory: "4Gi"
-```
+参数、资源预留和 vLLM 的 `/dev/shm`、环境变量等细节见 [docs/backends.md](docs/backends.md)。
 
-需要 GPU 时加一段 `gpu`：
+## 快速开始
 
-```yaml
-spec:
-  gpu:
-    count: 1     # 目前上限为 1
-    layers: 99   # 对应 --n-gpu-layers，99 表示全部层卸载
-```
-
-字段说明：
-
-- `source`：GGUF 模型文件下载地址。必须是 HTTPS，并且 URL path 以 `.gguf` 结尾。
-- `replicas`：推理 Pod 数量。可以设为 `0`，表示缩容到零。
-- `contextSize`：上下文窗口大小，单位是 token。
-- `image`：可选。留空时按是否请求 GPU 选默认镜像：GPU 用 `ghcr.io/ggml-org/llama.cpp:server-cuda`，CPU 用 `ghcr.io/ggml-org/llama.cpp:server`。
-- `resources`：推理容器的 CPU/内存请求和限制。建议显式配置，避免模型进程因为资源不足被 OOM Kill。
-- `gpu`：可选。写 `gpu: {}` 即请求一张 GPU（`count` 默认 1、上限 1），`layers` 默认 99，会翻译成 `--n-gpu-layers 99`；不想让 Cluster 里的 GPU 设备插件介入时就不写这一节。
-- `runtimeClassName`：可选。GPU 场景一般填 `nvidia`。留空时，只有在请求 GPU 的情况下才会回落到 controller 的环境变量 `GPU_RUNTIME_CLASS`；CPU 模式永远不加 `runtimeClassName`。
-- `extraArgs`：可选。透传给 `llama.cpp` server 的额外参数，永远追加在最后，因此可以覆盖 operator 生成的同名参数。
-
-## 本地快速体验
-
-下面以 kind 集群为例。
-
-### 1. 创建 kind 集群
+以 kind 为例：
 
 ```sh
 kind create cluster --config kind-config.yaml --image kindest/node:v1.32.2
+make install   # 安装 CRD
+make run       # 前台运行 controller（默认 emptyDir 缓存）
 ```
 
-### 2. 安装 CRD
-
-```sh
-make install
-```
-
-### 3. 启动本地 controller
-
-直接使用 `emptyDir` 存模型：
-
-```sh
-make run
-```
-
-如果你希望开发时复用已经下载过的模型，可以在 kind 节点里准备一个目录，然后通过 `MODEL_CACHE_HOST_PATH` 告诉 controller 使用 hostPath：
-
-```sh
-MODEL_CACHE_HOST_PATH=/var/lib/llmkube-models make run
-```
-
-当该变量为空时，Pod 会继续使用默认的 `emptyDir`。
-
-`MODEL_CACHE_HOST_PATH` 应该指向一个**专用目录**（例如 `/var/lib/llmkube-models`）：controller 会先起一个 `cache-prep` initContainer，把挂载点根目录 `chown 100:101`（只改根目录，不递归）以便推理容器可写。把它指向 `/var/lib` 这类已有目录会改动宿主机上其他文件的属主。
-
-### 4. 创建 Model
+另开一个终端：
 
 ```sh
 kubectl apply -f config/samples/llm_v1alpha1_model.yaml
-```
-
-查看状态：
-
-```sh
 kubectl get models
-kubectl describe model qwen3-0-6b
-kubectl get pods
-```
-
-第一次启动会下载模型，时间取决于网络和模型大小。为了避免大模型下载时间较长导致 Deployment 过早判定失败，controller 将 `progressDeadlineSeconds` 设置为 `1800` 秒。
-
-### 5. 访问推理接口
-
-把 Service 转发到本机：
-
-```sh
 kubectl port-forward svc/qwen3-0-6b 8080:8080
 ```
-
-发送 OpenAI 兼容请求：
 
 ```sh
 curl -s http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "messages": [
-      {
-        "role": "user",
-        "content": "用一句话介绍你自己 /no_think"
-      }
+      {"role": "user", "content": "用一句话介绍你自己 /no_think"}
     ],
     "max_tokens": 128
   }' | python3 -m json.tool
 ```
 
-正常情况下会返回类似 `chat.completion` 的 JSON 响应。
+第一次启动会下载模型，时间取决于网络和模型大小。controller 把 `progressDeadlineSeconds` 设为 1800 秒，避免慢网络下过早判定失败。
+
+需要复用已下载的模型、开启 GPU、或换 vLLM 后端时，见 [docs/model-reference.md](docs/model-reference.md)。
 
 ## 部署到真实集群
 
-如果要把 controller 作为 Deployment 跑在集群里，需要先构建并推送镜像：
-
 ```sh
 make docker-build docker-push IMG=<你的镜像仓库>/minillmkube:tag
-```
-
-然后部署 controller：
-
-```sh
 make deploy IMG=<你的镜像仓库>/minillmkube:tag
-```
-
-再创建示例模型：
-
-```sh
 kubectl apply -f config/samples/llm_v1alpha1_model.yaml
 ```
 
-如果只是本地开发，更推荐使用 `make run`，这样调试 controller 更方便。
+本地开发更推荐 `make run`，调试 controller 更方便。
 
-## 状态说明
+## 状态与排障
 
-`Model.status.phase` 当前有四种状态：
+`status.phase` 有五种：`Pending`（Deployment 已创建、尚未被观测）、`Deploying`（滚动中）、`Ready`（当前 generation 全部可用）、`Failed`（规格非法或 Deployment 报失败）、`ScaledToZero`（`spec.replicas` 为 0，Ready 条件为 False；缩容过程中 reason 为 `ScalingDown`，副本全部退出后为 `ScaledToZero`）。
 
-- `Pending`：Deployment 已创建，但还没有被 Kubernetes controller 观测到状态。
-- `Deploying`：正在创建或滚动更新，副本还没全部可用。
-- `Ready`：当前 Deployment generation 已观测，期望副本都已经可用。
-- `Failed`：规格非法，或 Deployment 报告了失败条件。
+`status.conditions` 里的 `Ready` 会带上失败原因；请求 GPU 时另有 `GPUOffload` 条件，用来区分「真的用上了 GPU」和「静默退回 CPU」。
 
-`Model.status.conditions` 里除了 `Ready`，请求 GPU 时还会有 `GPUOffload`：
+完整说明和常见场景见 [docs/troubleshooting.md](docs/troubleshooting.md)。
 
-- `True` / `OffloadDetected`：推理日志里读到 `llama_prepare_model_devices: using device CUDA0`，message 会带上原始整行。
-- `False` / `CPUFallback`：镜像已经启动，但 llama.cpp 退回了 CPU（例如驱动或 RuntimeClass 没配好）。这是最容易踩的坑：Pod 是 Ready 的，速度却只有 CPU 水平。
-- `Unknown` / `NotDetected`：Pod 还没 Ready、日志里还没有设备行，或者日志读不到。
+## 文档
 
-可以通过下面命令查看更详细的 condition：
-
-```sh
-kubectl describe model qwen3-0-6b
-```
-
-## 开发常用命令
-
-生成 CRD、RBAC 和 deepcopy 代码：
-
-```sh
-make manifests generate
-```
-
-构建 controller：
-
-```sh
-make build
-```
-
-运行测试：
-
-```sh
-make test
-```
-
-一次性执行生成、构建和测试：
-
-```sh
-make manifests generate build test
-```
-
-查看更多可用命令：
-
-```sh
-make help
-```
-
-## 清理
-
-删除示例 Model：
-
-```sh
-kubectl delete -f config/samples/llm_v1alpha1_model.yaml
-```
-
-卸载 CRD：
-
-```sh
-make uninstall
-```
-
-如果用 `make deploy` 部署过 controller，可以卸载 controller：
-
-```sh
-make undeploy
-```
-
-如果用 kind 创建了测试集群，可以删除集群：
-
-```sh
-kind delete cluster --name llmops
-```
+- [docs/ROADMAP.md](docs/ROADMAP.md)：开发计划、任务分解、进度表与边界问题清单
+- [docs/backends.md](docs/backends.md)：两种后端的参数、镜像体积与资源要求
+- [docs/model-reference.md](docs/model-reference.md)：`Model` 字段说明与缓存语义
+- [docs/troubleshooting.md](docs/troubleshooting.md)：状态、诊断原因与排障
 
 ## 当前边界
 
-这个项目目前聚焦在最小可用的 GGUF 推理部署流程，还没有覆盖完整生产能力：
+M1～M5 的代码已完成（当前在 `feat/m3-m4` 分支，尚未合入 `main`），本地 `make test` / `make lint` 通过。llama.cpp 侧已在单节点 K3s（RTX 5070 Ti Laptop，12 GB 显存）上跑通完整链路：权重下载与缓存命中 → GPU 推理 → Service 访问 → `GPUOffload=True`；**vLLM 侧的集群验收仍未执行**。
 
-- 暂未做多模型路由。
-- GPU 只做到「资源请求 + RuntimeClass 透传 + 日志确认」，不感知显卡型号、驱动版本，也不做多卡切分。
-- 暂未做 Pod 级别失败原因下钻。
-- 暂未提供 Helm Chart。
-- 目前默认推理后端是 `llama.cpp` server（M3 计划加入 vLLM）。
+- 暂未做多模型路由，暂未提供 Helm Chart。
+- GPU 只做到「资源请求 + RuntimeClass 透传 + 日志确认」，不感知显卡型号和驱动版本，不做多卡切分；GPU 副本按 `Recreate` 更新，避免旧 Pod 占着显卡不放。
+- vLLM 后端代码已完成，但 M3-T0 的 Blackwell + WSL2 手动 Pod 探查和集群推理验收尚未执行；启动探针阈值、GPU 显存利用率都还是估计值。
+- 放置字段只透传不校验：填错 `nodeSelector` 会表现成 `Unschedulable`，不会在 admission 阶段被拒绝。
+
+## 开发常用命令
+
+```sh
+make manifests generate   # 生成 CRD / RBAC / deepcopy
+make build                # 构建 controller
+make test                 # 运行测试（envtest）
+make lint                 # 静态检查
+make help                 # 查看全部命令
+```
 
 ## 许可证
 
